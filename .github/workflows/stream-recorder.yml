@@ -30,24 +30,22 @@ jobs:
         run: python -m pytest tests/scripts/stream_recorder -q
       - name: Install Chromium
         run: python -m playwright install --with-deps chromium
-      - name: Diagnose real public webcam discovery layers
+      - name: Discover Brussels Grand Place HLS webcam
         run: |
-          set +e
-          timeout 30s python -u - <<'PY'
-          from scripts.stream_recorder.discovery import discover_http
-          url = 'https://webcamsittard.nl/'
-          print('HTTP_START', flush=True)
-          print(sorted(discover_http(url)), flush=True)
-          print('HTTP_DONE', flush=True)
-          PY
-          echo "HTTP_RC=$?"
+          timeout 90s python -m scripts.stream_recorder.main discover \
+            --url 'https://www.brussels.be/webcam-grand-place' \
+            --candidates-only \
+            > /tmp/discovery.json
+          cat /tmp/discovery.json
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          from urllib.parse import urlparse
 
-          timeout 30s python -u - <<'PY'
-          from scripts.stream_recorder.discovery import discover_browser
-          url = 'https://webcamsittard.nl/'
-          print('BROWSER_START', flush=True)
-          print(sorted(discover_browser(url)), flush=True)
-          print('BROWSER_DONE', flush=True)
+          result = json.loads(Path('/tmp/discovery.json').read_text())
+          candidates = result['candidates']
+          assert candidates, 'No .m3u8 candidate discovered from the Brussels Grand Place webcam'
+          assert all('.m3u8' in url.lower() for url in candidates)
+          assert any(urlparse(url).hostname == 'livecam.brucity.be' for url in candidates), candidates
+          print(f"discovered_m3u8={len(candidates)}")
           PY
-          echo "BROWSER_RC=$?"
-          exit 1
