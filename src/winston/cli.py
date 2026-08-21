@@ -2,7 +2,7 @@ import argparse
 from pathlib import Path
 from typing import Sequence
 
-from winston.config import settings
+from winston.config import get_config
 from winston.ingest.models import ImageMetadata, VideoMetadata
 from winston.ingest.probe import probe_media
 from winston.ingest.scanner import scan_media
@@ -41,11 +41,12 @@ def scan_command(root: Path) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
+    config = get_config()
     parser = argparse.ArgumentParser(prog="winston")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     scan_parser = subparsers.add_parser("scan", help="Discover and inspect local media files")
-    scan_parser.add_argument("path", nargs="?", type=Path, default=settings.data_dir)
+    scan_parser.add_argument("path", nargs="?", type=Path, default=config.data_dir)
     return parser
 
 
