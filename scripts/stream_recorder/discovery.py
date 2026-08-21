@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from html.parser import HTMLParser
 import re
 import ssl
 from urllib.parse import urljoin
@@ -12,19 +10,6 @@ _M3U8_RE = re.compile(
     r"(?P<url>(?:https?:)?(?:\\?/[^\s'\"<>]*)?[^\s'\"<>]*?\.m3u8(?:\?[^\s'\"<>]*)?)",
     re.IGNORECASE,
 )
-
-
-class _IframeParser(HTMLParser):
-    def __init__(self) -> None:
-        super().__init__()
-        self.sources: list[str] = []
-
-    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        if tag.lower() != "iframe":
-            return
-        for key, value in attrs:
-            if key.lower() == "src" and value:
-                self.sources.append(value)
 
 
 def _normalize_escaped_url(value: str) -> str:
@@ -41,10 +26,14 @@ def extract_m3u8_urls(text: str, base_url: str) -> set[str]:
     return urls
 
 
-def extract_iframe_urls(text: str, base_url: str) -> set[str]:
-    parser = _IframeParser()
-    parser.feed(text)
-    return {urljoin(base_url, value) for value in parser.sources}
+def extract_rendered_frame_m3u8_urls(frames) -> set[str]:
+    streams: set[str] = set()
+    for frame in frames:
+        try:
+            streams.update(extract_m3u8_urls(frame.content(), frame.url))
+        except Exception:
+            continue
+    return streams
 
 
 def fetch_text(url: str, timeout: float = 20.0) -> tuple[str, str]:
@@ -63,29 +52,9 @@ def fetch_text(url: str, timeout: float = 20.0) -> tuple[str, str]:
     return body, final_url
 
 
-def _discover_iframe(iframe_url: str, timeout: float) -> set[str]:
-    iframe_body, iframe_final_url = fetch_text(iframe_url, timeout=timeout)
-    return extract_m3u8_urls(iframe_body, iframe_final_url)
-
-
-def discover_http(url: str, iframe_depth: int = 1, iframe_timeout: float = 8.0) -> set[str]:
+def discover_http(url: str) -> set[str]:
     body, final_url = fetch_text(url)
-    streams = extract_m3u8_urls(body, final_url)
-    if iframe_depth <= 0:
-        return streams
-
-    iframe_urls = extract_iframe_urls(body, final_url)
-    if not iframe_urls:
-        return streams
-
-    with ThreadPoolExecutor(max_workers=min(len(iframe_urls), 8), thread_name_prefix="iframe-scan") as pool:
-        futures = [pool.submit(_discover_iframe, iframe_url, iframe_timeout) for iframe_url in iframe_urls]
-        for future in as_completed(futures):
-            try:
-                streams.update(future.result())
-            except Exception:
-                continue
-    return streams
+    return extract_m3u8_urls(body, final_url)
 
 
 def discover_browser(url: str, timeout_ms: int = 20_000, settle_ms: int = 5_000) -> set[str]:
@@ -107,7 +76,7 @@ def discover_browser(url: str, timeout_ms: int = 20_000, settle_ms: int = 5_000)
             page.on("request", collect)
             page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
             page.wait_for_timeout(settle_ms)
-            streams.update(extract_m3u8_urls(page.content(), page.url))
+            streams.update(extract_rendered_frame_m3u8_urls(page.frames))
         finally:
             browser.close()
     return streams
