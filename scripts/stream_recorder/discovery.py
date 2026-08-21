@@ -1,24 +1,30 @@
+"""Discover public HLS streams from HTML pages and browser network traffic."""
+
 from __future__ import annotations
 
-from collections import deque
-from collections.abc import Callable
+import asyncio
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager
 import re
 import ssl
+from typing import Any
 from urllib.parse import urljoin
 from urllib.request import Request, urlopen
 
 
 _M3U8_RE = re.compile(
-    r"(?P<url>(?:https?:)?(?:\\?/[^\s'\"<>]*)?[^\s'\"<>]*?\.m3u8(?:\?[^\s'\"<>]*)?)",
+    r"(?P<url>(?:https?:)?(?:\\?/[^^\s'\"<>]*)?[^\s'\"<>]*?\.m3u8(?:\?[^\s'\"<>]*)?)".replace("[^^", "[^") ,
     re.IGNORECASE,
 )
 
 
 def _normalize_escaped_url(value: str) -> str:
+    """Normalize slash-escaped and HTML-escaped URLs found in page source."""
     return value.replace("\\/", "/").replace("&amp;", "&")
 
 
 def extract_m3u8_urls(text: str, base_url: str) -> set[str]:
+    """Extract absolute HLS playlist URLs from arbitrary HTML or JavaScript text."""
     urls: set[str] = set()
     for match in _M3U8_RE.finditer(text):
         raw = _normalize_escaped_url(match.group("url")).strip()
@@ -28,35 +34,8 @@ def extract_m3u8_urls(text: str, base_url: str) -> set[str]:
     return urls
 
 
-def crawl_browser_targets(
-    root_url: str,
-    visit: Callable[[str], tuple[set[str], set[str]]],
-    *,
-    max_iframe_depth: int = 2,
-) -> set[str]:
-    streams: set[str] = set()
-    seen: set[str] = set()
-    pending = deque([(root_url, 0)])
-
-    while pending:
-        target_url, depth = pending.popleft()
-        if target_url in seen:
-            continue
-        seen.add(target_url)
-
-        target_streams, iframe_urls = visit(target_url)
-        streams.update(target_streams)
-
-        if depth >= max_iframe_depth:
-            continue
-        for iframe_url in sorted(iframe_urls):
-            if iframe_url not in seen:
-                pending.append((iframe_url, depth + 1))
-
-    return streams
-
-
-def fetch_text(url: str, timeout: float = 20.0) -> tuple[str, str]:
+def _fetch_text_sync(url: str, timeout: float) -> tuple[str, str]:
+    """Fetch text with urllib for execution in a worker thread."""
     request = Request(
         url,
         headers={
@@ -72,77 +51,165 @@ def fetch_text(url: str, timeout: float = 20.0) -> tuple[str, str]:
     return body, final_url
 
 
-def discover_http(url: str) -> set[str]:
-    body, final_url = fetch_text(url)
+async def fetch_text(url: str, timeout: float = 20.0) -> tuple[str, str]:
+    """Fetch text without blocking the asyncio event loop."""
+    # urllib is intentionally kept to avoid another runtime dependency; move it to a thread.
+    return await asyncio.to_thread(_fetch_text_sync, url, timeout)
+
+
+async def discover_http(url: str) -> set[str]:
+    """Discover HLS URLs visible directly in the source page response."""
+    body, final_url = await fetch_text(url)
     return extract_m3u8_urls(body, final_url)
 
 
-def _iframe_urls(page) -> set[str]:
-    urls = page.locator("iframe").evaluate_all(
+async def crawl_browser_targets(
+    root_url: str,
+    visit: Callable[[str], Awaitable[tuple[set[str], set[str]]]],
+    *,
+    max_iframe_depth: int = 2,
+) -> set[str]:
+    """Visit browser targets breadth-first while running siblings concurrently."""
+    streams: set[str] = set()
+    seen: set[str] = set()
+    current_level = {root_url}
+
+    for depth in range(max_iframe_depth + 1):
+        targets = sorted(url for url in current_level if url not in seen)
+        if not targets:
+            break
+        seen.update(targets)
+
+        # Every independent page/player at the same depth is opened concurrently.
+        results = await asyncio.gather(*(visit(target) for target in targets), return_exceptions=True)
+        next_level: set[str] = set()
+        for result in results:
+            if isinstance(result, BaseException):
+                continue
+            target_streams, iframe_urls = result
+            streams.update(target_streams)
+            if depth < max_iframe_depth:
+                next_level.update(url for url in iframe_urls if url not in seen)
+        current_level = next_level
+
+    return streams
+
+
+async def _iframe_urls(page: Any) -> set[str]:
+    """Return absolute iframe source URLs exposed by a rendered Playwright page."""
+    urls = await page.locator("iframe").evaluate_all(
         "elements => elements.map(element => element.src).filter(Boolean)"
     )
-    return {url for url in urls if isinstance(url, str) and url.startswith(("http://", "https://"))}
+    return {
+        url
+        for url in urls
+        if isinstance(url, str) and url.startswith(("http://", "https://"))
+    }
 
 
-def _visit_browser_target(browser, url: str, *, timeout_ms: int, settle_ms: int) -> tuple[set[str], set[str]]:
+async def _visit_browser_target(
+    browser: Any,
+    url: str,
+    *,
+    timeout_ms: int,
+    settle_ms: int,
+) -> tuple[set[str], set[str]]:
+    """Observe one page/player in an isolated browser context and collect HLS requests."""
     streams: set[str] = set()
-    context = browser.new_context()
+    context = await browser.new_context()
     try:
-        page = context.new_page()
+        page = await context.new_page()
 
-        def collect(request) -> None:
+        def collect(request: Any) -> None:
+            """Capture HLS requests emitted while the target page is running."""
             if ".m3u8" in request.url.lower():
                 streams.add(request.url)
 
         page.on("request", collect)
-        page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
-        page.wait_for_timeout(settle_ms)
-        return streams, _iframe_urls(page)
+        await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+        await page.wait_for_timeout(settle_ms)
+        return streams, await _iframe_urls(page)
     finally:
-        context.close()
+        await context.close()
 
 
-def discover_browser(
+@asynccontextmanager
+async def browser_session(enabled: bool = True) -> AsyncIterator[Any | None]:
+    """Yield one shared Chromium browser for concurrent source discovery."""
+    if not enabled:
+        yield None
+        return
+
+    try:
+        from playwright.async_api import async_playwright
+    except ImportError as exc:
+        raise RuntimeError("playwright is required for browser-based stream discovery") from exc
+
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch(headless=True)
+        try:
+            yield browser
+        finally:
+            await browser.close()
+
+
+async def discover_browser(
     url: str,
+    *,
+    browser: Any,
     timeout_ms: int = 20_000,
     settle_ms: int = 5_000,
     max_iframe_depth: int = 2,
 ) -> set[str]:
-    try:
-        from playwright.sync_api import sync_playwright
-    except ImportError as exc:
-        raise RuntimeError("playwright is required for browser-based stream discovery") from exc
+    """Discover HLS requests from a page and its isolated iframe/player targets."""
+    if browser is None:
+        raise RuntimeError("browser discovery requires an active browser session")
 
-    with sync_playwright() as playwright:
-        browser = playwright.chromium.launch(headless=True)
+    async def visit(target_url: str) -> tuple[set[str], set[str]]:
+        """Visit one target while converting target-specific failures to an empty result."""
         try:
-            def visit(target_url: str) -> tuple[set[str], set[str]]:
-                try:
-                    return _visit_browser_target(
-                        browser,
-                        target_url,
-                        timeout_ms=timeout_ms,
-                        settle_ms=settle_ms,
-                    )
-                except Exception:
-                    return set(), set()
-
-            return crawl_browser_targets(url, visit, max_iframe_depth=max_iframe_depth)
-        finally:
-            browser.close()
-
-
-def discover_page(url: str, use_browser_fallback: bool = True) -> set[str]:
-    streams: set[str] = set()
-    try:
-        streams.update(discover_http(url))
-    except Exception:
-        pass
-
-    if use_browser_fallback:
-        try:
-            streams.update(discover_browser(url))
+            return await _visit_browser_target(
+                browser,
+                target_url,
+                timeout_ms=timeout_ms,
+                settle_ms=settle_ms,
+            )
         except Exception:
-            if not streams:
-                raise
+            # A broken third-party player must not prevent other cameras from being discovered.
+            return set(), set()
+
+    return await crawl_browser_targets(url, visit, max_iframe_depth=max_iframe_depth)
+
+
+async def discover_page(
+    url: str,
+    *,
+    use_browser_fallback: bool = True,
+    browser: Any | None = None,
+) -> set[str]:
+    """Run direct HTTP and browser discovery concurrently for one source page."""
+    if use_browser_fallback and browser is None:
+        async with browser_session() as local_browser:
+            return await discover_page(
+                url,
+                use_browser_fallback=True,
+                browser=local_browser,
+            )
+
+    coroutines: list[Awaitable[set[str]]] = [discover_http(url)]
+    if use_browser_fallback:
+        coroutines.append(discover_browser(url, browser=browser))
+
+    # HTTP source inspection and browser observation are independent I/O paths.
+    results = await asyncio.gather(*coroutines, return_exceptions=True)
+    streams: set[str] = set()
+    errors: list[BaseException] = []
+    for result in results:
+        if isinstance(result, BaseException):
+            errors.append(result)
+        else:
+            streams.update(result)
+
+    if not streams and len(errors) == len(results):
+        raise errors[0]
     return streams
