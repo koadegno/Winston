@@ -12,9 +12,14 @@ from .orchestrator import assign_camera_ids, record_source_forever
 from .sources import Source, load_sources
 
 
-def discover_url(url: str, *, use_browser_fallback: bool = True) -> dict[str, object]:
+def discover_url(
+    url: str,
+    *,
+    use_browser_fallback: bool = True,
+    resolve: bool = True,
+) -> dict[str, object]:
     candidates = discover_page(url, use_browser_fallback=use_browser_fallback)
-    cameras = assign_camera_ids(resolve_cameras(candidates))
+    cameras = assign_camera_ids(resolve_cameras(candidates)) if resolve else []
     return {
         "url": url,
         "candidates": sorted(candidates),
@@ -71,6 +76,11 @@ def build_parser() -> argparse.ArgumentParser:
     target.add_argument("--url")
     target.add_argument("--xlsb", type=Path)
     discover.add_argument("--no-browser", action="store_true", help="Disable Playwright fallback.")
+    discover.add_argument(
+        "--candidates-only",
+        action="store_true",
+        help="Only discover .m3u8 URLs; do not fetch/resolve the HLS playlists.",
+    )
 
     record = subparsers.add_parser("record", help="Record all non-YouTube sources from Place_Overview.xlsb.")
     record.add_argument("--xlsb", type=Path, required=True)
@@ -85,7 +95,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "discover":
         use_browser = not args.no_browser
         payload = (
-            discover_url(args.url, use_browser_fallback=use_browser)
+            discover_url(
+                args.url,
+                use_browser_fallback=use_browser,
+                resolve=not args.candidates_only,
+            )
             if args.url
             else _discover_xlsb(args.xlsb, use_browser_fallback=use_browser)
         )
