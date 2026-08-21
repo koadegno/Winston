@@ -1,36 +1,159 @@
 # Winston architecture
 
-## Purpose
+## 1. Purpose
 
-Winston is a semantic search engine for recorded surveillance footage and photos.
+Winston is a semantic search engine for large collections of recorded surveillance video and photos.
 
-The core requirement is that indexing must **not depend on knowing in advance what a future user will search for**. A user should be able to search for visual concepts that were never declared as detector classes during ingestion, for example:
+The system must let a user search for things that were **not declared as classes at indexing time**, for example:
 
-- `man wearing a green Nike cap`
-- `woman with a pink stroller`
-- `red car running a red light`
-- `blue car with license plate XXX-YYY-ZZZ`
+```text
+man wearing a green Nike cap
+woman with a pink stroller
+red car running a red light
+blue car with license plate XXX-YYY-ZZZ
+```
 
-These examples do not all require the same retrieval technique. Winston therefore separates coarse semantic retrieval from later specialized enrichment and temporal reasoning.
+Those examples span three different problems:
 
-## Non-negotiable design principles
+- visual semantic retrieval;
+- exact text recognition such as license plates;
+- temporal/action understanding.
 
-1. **No predefined object classes in the baseline semantic index.**
-   Winston must not require YOLO classes, tracked objects, labels, or a classifier-defined ontology before an image can be indexed.
-2. **Offline files first.**
-   The first product surface is a dataset of existing video and image files. Live camera ingestion is a later concern.
-3. **Coarse-to-fine search.**
-   Build a cheap broad index over sparse video samples, retrieve candidate regions/windows, then spend more compute only around promising results.
-4. **Raw media is not stored in Qdrant.**
-   Videos and images remain on filesystem/object storage. Qdrant stores vectors and searchable metadata that point back to the source media.
-5. **Model/index compatibility is explicit.**
-   Every indexed vector must be traceable to the embedding model and preprocessing version that produced it. Changing either requires reindexing.
-6. **Exact text and temporal actions are separate problems from visual similarity.**
-   CLIP-style retrieval is the first-stage candidate generator; OCR/ALPR and temporal reasoning are added as dedicated later stages.
+Winston therefore uses a broad class-agnostic visual index as its first-stage retriever, then adds specialized verification/enrichment only where needed.
 
-## Current repository structure
+---
 
-The repository already reserves the following package boundaries:
+## 2. Architectural invariants
+
+These rules define the project unless a later design decision explicitly replaces them.
+
+1. **No predefined object classes for the baseline index.**
+   YOLO classes, tracked objects, labels, or a fixed ontology must not decide what can be searched later.
+2. **Recorded files first.**
+   V0 indexes existing video/image files. Continuous RTSP/HLS ingestion comes later.
+3. **Coarse-to-fine retrieval.**
+   Keep the global index sparse, retrieve candidate locations cheaply, then spend extra compute only around the best candidates.
+4. **Raw media stays outside Qdrant.**
+   Qdrant stores vectors and searchable metadata pointing back to source media.
+5. **Sampling is replaceable.**
+   Keyframes are the initial strategy, not a permanent assumption.
+6. **A region is geometry, not a detection.**
+   Coordinates describe a deterministic crop/tile and do not imply that an object detector found anything there.
+7. **Embedding compatibility is explicit.**
+   Model identity, vector dimension, and preprocessing version are part of the index contract.
+8. **Exact identifiers and actions are specialized stages.**
+   CLIP-style similarity should not be forced to solve exact license plates or multi-frame actions alone.
+
+---
+
+## 3. Existing repository workstreams
+
+### `feat/media-ingest`
+
+At the time of writing, this branch has draft PR #1 open against `main` and is mergeable.
+
+It already implements the beginning of Winston's core ingestion layer:
+
+- recursive local media discovery;
+- typed media metadata;
+- `ffprobe` probing;
+- Winston settings for data directory and `ffprobe`;
+- `winston scan [path]`;
+- tests for scanning, probing, and CLI output.
+
+This branch is a **runtime foundation** and should be merged before the indexing pipeline is built on top of it.
+
+### `feat/public-stream-recorder`
+
+At the time of writing, this branch has PR #2 open against `main` and is mergeable.
+
+It implements one-shot dataset acquisition tooling under:
+
+```text
+scripts/stream_recorder/
+```
+
+It:
+
+- discovers public HLS webcam streams;
+- resolves `.m3u8` streams, including JavaScript-driven players;
+- records with FFmpeg stream copy;
+- writes UTC hour-aligned MKV files;
+- persists source/camera metadata;
+- excludes YouTube and YouTube Live;
+- includes unit/local integration tests and a live-webcam smoke test.
+
+This workstream is **not Winston runtime code**. It produces realistic recorded media that the normal Winston ingestion/indexing pipeline can consume.
+
+The two branches are therefore complementary:
+
+```text
+feat/public-stream-recorder
+        ↓
+recorded dataset
+        ↓
+feat/media-ingest
+        ↓
+Winston indexing/search
+```
+
+But the recorder does not block semantic-index development; Winston must also work with arbitrary local media not produced by that script.
+
+---
+
+## 4. High-level system
+
+```text
+                          MEDIA
+                 ┌─────────┴─────────┐
+                 │                   │
+               VIDEO               IMAGE
+                 │                   │
+                 └─────────┬─────────┘
+                           ▼
+                         INGEST
+                  discover + probe assets
+                           │
+                           ▼
+                        SAMPLING
+                  video keyframes / photo
+                           │
+                           ▼
+                        REGIONS
+                 full frame + fixed crops
+                           │
+                           ▼
+                       EMBEDDINGS
+                Jina CLIP v1 image encoder
+                           │
+                           ▼
+                         QDRANT
+                 vectors + media metadata
+                           ▲
+                           │
+                Jina CLIP v1 text encoder
+                           ▲
+                           │
+                         QUERY
+                           │
+                           ▼
+                         SEARCH
+                retrieve + group + rerank
+                           │
+                           ▼
+                   CANDIDATE WINDOWS
+                           │
+              ┌────────────┼────────────┐
+              ▼            ▼            ▼
+          dense local    OCR/ALPR     temporal
+          refinement                  reasoning
+```
+
+---
+
+## 5. Package boundaries
+
+The repository already reserves the V0 package shape:
 
 ```text
 src/winston/
@@ -44,100 +167,52 @@ src/winston/
 └── __init__.py
 ```
 
-These boundaries remain the V0 architecture.
-
-Future capabilities such as OCR/ALPR and temporal reasoning should only gain dedicated modules when their roadmap phase starts. They should not be mixed into the baseline semantic retrieval code.
-
-## Existing workstreams
-
-Two feature branches already exist and are part of this design.
-
-### `feat/media-ingest`
-
-Status: active branch, draft PR #1 open against `main`.
-
-This branch implements the beginning of Winston's runtime ingestion layer:
-
-- recursive discovery of supported local media;
-- media metadata models;
-- `ffprobe`-based video/image probing;
-- Winston settings for the data directory and `ffprobe` binary;
-- a `winston scan` CLI command;
-- tests for scanning, probing, and CLI output.
-
-This is the foundation for the indexing pipeline and should be merged before the semantic indexing phases are built on top of it.
-
-### `feat/public-stream-recorder`
-
-Status: active branch, not yet represented by a PR at the time this document was written.
-
-This branch implements **one-shot dataset acquisition tooling**, not Winston's core runtime. It lives under `scripts/stream_recorder/` and:
-
-- discovers public HLS webcam streams;
-- resolves `.m3u8` candidates;
-- records streams with FFmpeg;
-- writes hourly MKV files plus source/camera metadata;
-- intentionally excludes YouTube and YouTube Live.
-
-This workstream feeds recorded media into Winston's offline dataset. It should stay under `scripts/` and must not become a dependency of the core semantic-search package.
-
-## High-level system
+Target V0 implementation:
 
 ```text
-                         RECORDED MEDIA
-                ┌──────────────┴──────────────┐
-                │                             │
-              VIDEO                         IMAGE
-                │                             │
-                └──────────────┬──────────────┘
-                               │
-                               ▼
-                            INGEST
-                    discover + probe media
-                               │
-                               ▼
-                           SAMPLING
-              video keyframes / image candidate
-                               │
-                               ▼
-                     SPATIAL REGIONS/CROPS
-                  full image + fixed regions
-                               │
-                               ▼
-                         EMBEDDINGS
-                   Jina CLIP v1 image encoder
-                               │
-                               ▼
-                            QDRANT
-                 visual vectors + media payload
-                               ▲
-                               │
-                   Jina CLIP v1 text encoder
-                               ▲
-                               │
-                           USER QUERY
-                               │
-                               ▼
-                            SEARCH
-               retrieve + group + rank candidates
-                               │
-                               ▼
-                      CANDIDATE WINDOWS
-                               │
-                    later refinement stages
-               ┌───────────────┼────────────────┐
-               ▼               ▼                ▼
-            dense          OCR / ALPR         temporal
-          re-decode                          reasoning
+src/winston/
+├── ingest/
+│   ├── models.py
+│   ├── probe.py
+│   └── scanner.py
+├── sampling/
+│   ├── base.py
+│   ├── keyframes.py
+│   └── regions.py
+├── embeddings/
+│   ├── base.py
+│   └── jina_clip.py
+├── index/
+│   └── qdrant.py
+├── search/
+│   ├── engine.py
+│   ├── grouping.py
+│   └── models.py
+├── utils/
+├── config.py
+├── cli.py
+└── __init__.py
 ```
 
-## 1. Ingestion
+This is a design target, not a request to create empty placeholder files in advance.
 
-Responsibility: discover source assets and describe them deterministically before indexing.
+Future modules should appear only when implemented, for example:
 
-The `feat/media-ingest` branch is the first implementation of this layer.
+```text
+ocr/          # exact text / ALPR
+ temporal/    # action understanding
+ descriptions/# optional VLM-generated descriptions
+```
 
-A media asset should expose at least:
+---
+
+## 6. Ingestion
+
+Responsibility: discover media and extract deterministic metadata before indexing.
+
+The `feat/media-ingest` branch already establishes this layer.
+
+A source asset needs at least:
 
 ```text
 asset_id
@@ -145,59 +220,66 @@ path
 media_type          # video | image
 width
 height
-codec               # video only
-duration_seconds    # video only
-fps                  # video only
+codec               # video
+fps                  # video
+duration_seconds    # video
 ```
 
-The initial source of truth can remain the filesystem plus a small local catalog/manifest. Qdrant is not the canonical media catalog.
+The initial source of truth can be the filesystem plus a small local manifest/catalog. Qdrant is not the authoritative media catalog.
 
-## 2. Temporal sampling
+Asset identity must be stable enough to support idempotent reindexing. The exact strategy can be path + file metadata initially, and later a stronger content identity if needed.
 
-### Baseline: video keyframes
+---
 
-For V0, recorded video is sampled using decoder keyframes rather than every decoded frame.
+## 7. Temporal sampling
 
-The important concept for Winston is the decoder's `key_frame == 1` signal, not merely `pict_type == I`. H.264/H.265 concepts such as I-frames, IDR frames and other random-access pictures are related but not identical. The implementation should therefore expose a generic `KeyframeSampler` abstraction.
+### V0: decoder keyframes
 
-Why use keyframes:
+Winston does not embed every frame of every video.
 
-- they drastically reduce the number of frames that must be decoded and embedded;
+The first sampler uses decoder keyframes discovered through FFmpeg/ffprobe. The implementation should rely on the decoder-level `key_frame == 1` signal rather than equating every useful random-access point with `pict_type == I`.
+
+Why keyframes are useful:
+
+- far fewer frames need to be decoded;
 - they are natural random-access points in compressed video;
-- typical surveillance GOPs can reduce the sampled frame count by tens of times compared with indexing every frame.
+- surveillance footage commonly has GOPs that reduce the sample count by tens of times compared with indexing every frame.
 
 Important limitation:
 
-**keyframes are codec decisions, not semantic decisions.** A short visual event can occur entirely between two keyframes. Therefore keyframe-only sampling is the V0 baseline, not a permanent assumption.
+**keyframes are compression decisions, not semantic decisions.**
 
-The sampling interface should make future alternatives possible without changing embedding/index/search code:
+A short event can occur entirely between two keyframes. Therefore the code must hide sampling behind an abstraction:
 
 ```text
 FrameSampler
-├── KeyframeSampler      # V0
-├── PeriodicSampler      # future
-├── SceneChangeSampler   # future
-└── HybridSampler        # future
+├── KeyframeSampler      # V0 baseline
+├── PeriodicSampler      # future experiment
+├── SceneChangeSampler   # future experiment
+└── HybridSampler        # future experiment
 ```
 
-Each sampled frame must keep its exact source timestamp.
+Every sampled video frame keeps its exact source timestamp.
 
-### Photos
+A photo is already a single temporal sample.
 
-A photo is already a single temporal sample and enters directly into spatial-region generation.
+---
 
-## 3. Spatial candidate generation
+## 8. Spatial regions
 
-Winston must remain class-agnostic at indexing time.
+The V0 index remains class-agnostic.
 
-The V0 spatial stage therefore creates deterministic image regions without asking an object detector what is present. At minimum it should index:
+Each sampled image produces deterministic visual candidates such as:
 
-- the full sampled image;
-- a fixed set of overlapping regions/crops at one or more scales.
+```text
+full image
+fixed overlapping tiles/crops
+possibly multiple scales
+```
 
-A stored `region` is simply geometry describing which pixels were embedded. It is **not** a detection bounding box and does not imply any object class.
+No detector determines which regions exist.
 
-Example metadata:
+For each region store geometry such as:
 
 ```text
 region_kind = full | tile
@@ -208,64 +290,78 @@ height
 scale
 ```
 
-This preserves Winston's ability to retrieve an arbitrary future concept while still allowing small details to contribute strongly to an embedding.
+These coordinates only tell Winston which pixels produced an embedding and later allow the result viewer/refiner to return to the matching part of the image.
 
-## 4. Visual embedding
+---
 
-### Baseline model: Jina CLIP v1
+## 9. Multimodal embedding
 
-V0 uses the Jina CLIP v1 multimodal embedding space:
+### Baseline: Jina CLIP v1
+
+V0 uses the Jina CLIP v1 shared text/image embedding space.
+
+Image side:
 
 ```text
-image / region
-    ↓
+sampled image / region
+        ↓
 Jina CLIP v1 image encoder
-    ↓
-768-dimensional visual embedding
+        ↓
+768-D vector
 ```
 
-At query time:
+Query side:
 
 ```text
-natural-language query
-    ↓
+natural-language text
+        ↓
 Jina CLIP v1 text encoder
-    ↓
-768-dimensional text embedding
+        ↓
+768-D vector
 ```
 
-Both encoders are two halves of the same CLIP-style model and produce vectors intended to be compared in the same embedding space.
+The two encoders belong to the same CLIP-style model and are trained so their vectors are directly comparable.
 
-The baseline similarity metric is cosine similarity/distance.
+Baseline metric:
 
-The embedding implementation must hide model details behind an interface so a later model can be benchmarked without rewriting sampling or search.
+```text
+cosine
+```
 
-Suggested contract:
+The implementation should expose a model-independent interface:
 
 ```text
 MultimodalEmbedder
-├── embed_images(images) -> vectors
-├── embed_text(texts) -> vectors
+├── embed_images(images)
+├── embed_text(texts)
 ├── dimension
 ├── model_id
 └── preprocessing_version
 ```
 
-## 5. Qdrant semantic index
+Changing model/preprocessing invalidates compatible index assumptions and must trigger explicit reindexing.
+
+---
+
+## 10. Qdrant index
 
 Qdrant is Winston's semantic retrieval database.
 
-The repository already starts Qdrant through `compose.yml` with persistent storage under `./volumes/qdrant`.
+`main` already starts Qdrant through `compose.yml` and persists it under:
 
-### Initial collection
+```text
+./volumes/qdrant
+```
 
-Start with one collection dedicated to visual candidates, for example:
+### V0 collection
+
+Start with one visual collection:
 
 ```text
 winston_visual
 ```
 
-Initial vector configuration:
+Vector configuration:
 
 ```text
 name: visual
@@ -273,7 +369,7 @@ size: 768
 metric: cosine
 ```
 
-A Qdrant point represents **one indexed visual candidate**: either a full sampled frame/image or one deterministic region of it.
+One Qdrant point represents one indexed visual candidate: either a full sampled image or one deterministic region.
 
 Suggested payload:
 
@@ -296,35 +392,41 @@ Suggested payload:
 }
 ```
 
-For photos, `timestamp_seconds` can be null/omitted.
+For photos, timestamp is omitted/null.
 
-The Qdrant point id must be deterministic so rerunning an index job is idempotent. It should derive from stable asset identity + sample timestamp + region identity + model/preprocessing version.
+Point IDs must be deterministic so repeated indexing is idempotent. They should derive from stable asset identity + temporal sample identity + region identity + model/preprocessing version.
 
-### Why Qdrant instead of Frigate's sqlite-vec design
+### Why Qdrant
 
-Frigate can keep its vector count low because it indexes one representative thumbnail per tracked object. Winston intentionally does not require tracked objects, so the number of vectors can become much larger. Qdrant/HNSW is therefore a better fit for the expected scale and supports metadata filtering as part of retrieval.
+Frigate can use brute-force `sqlite-vec` because it heavily reduces the index to tracked-object thumbnails. Winston deliberately indexes content without requiring tracked objects, so vector counts can be much larger. Qdrant/HNSW plus payload filtering is a better match for the expected scale.
 
-## 6. Indexing pipeline
+---
 
-The first complete indexing path should be:
+## 11. V0 indexing pipeline
 
 ```text
 asset discovery
     ↓
 media probe
     ↓
-keyframe extraction (video) / image input
+keyframe extraction (video) / photo
     ↓
-spatial regions
+deterministic regions
     ↓
 batched Jina CLIP image embedding
     ↓
 batched Qdrant upsert
 ```
 
-The pipeline must be restartable and idempotent. Re-running the same indexing job must not create duplicate semantic candidates.
+Properties:
 
-Index progress should eventually distinguish at least:
+- restartable;
+- idempotent;
+- raw media never inserted into Qdrant;
+- explicit failures per asset/sample;
+- model/preprocessing metadata stored with points.
+
+Index progress can eventually expose states such as:
 
 ```text
 discovered
@@ -335,19 +437,19 @@ indexed
 failed
 ```
 
-V0 does not need a distributed worker system; correctness and measurable retrieval quality come first.
+A distributed worker system is not required for V0.
 
-## 7. Search pipeline
+---
 
-### V0 visual semantic retrieval
+## 12. V0 search pipeline
 
-For a query such as:
+Example:
 
 ```text
 woman with a pink stroller
 ```
 
-Winston performs:
+Path:
 
 ```text
 query
@@ -356,97 +458,140 @@ Jina CLIP v1 text encoder
   ↓
 query vector
   ↓
-Qdrant cosine search
+Qdrant cosine retrieval
   ↓
 top visual candidates
   ↓
-group nearby results by asset + time
+group nearby candidates by asset/time
   ↓
-rank candidate frames/windows
+rank user-facing hits
   ↓
-source path + timestamp + matching region
+source + timestamp + matching region
 ```
 
-The grouping step matters because adjacent keyframes/regions from the same event should not fill the entire result list as independent user-facing hits.
+Grouping is necessary so adjacent keyframes/tiles from one event do not flood the result list as separate user-facing hits.
 
-The baseline ranking should preserve raw retrieval scores. UI-friendly percentages should not be invented until they are calibrated against a real evaluation set.
+V0 should return raw semantic scores. Do not invent a human confidence percentage before calibration on an evaluation set.
 
-### Coarse-to-fine refinement
+---
 
-Once V0 retrieval works, Winston should use the sparse index only to locate promising temporal windows.
+## 13. Coarse-to-fine refinement
 
-For a candidate around timestamp `t`:
+The global sparse index is a candidate generator, not necessarily the final timestamp detector.
+
+For a hit around time `t`:
 
 ```text
 Qdrant hit at t
     ↓
-decode a bounded window around t
+create bounded time window around t
+    ↓
+decode intermediate frames
     ↓
 sample more densely
     ↓
-re-embed / rerank locally
+local embedding/reranking
     ↓
-return a more precise timestamp/range
+precise timestamp/range
 ```
 
-This allows the global index to stay economical while avoiding the permanent recall limitations of keyframe-only sampling.
+This is how Winston can keep indexing cost low while recovering short events that keyframe-only indexing can miss.
 
-## 8. Exact text: OCR / ALPR
+Dense refinement should initially happen at query time and should not globally persist every intermediate frame unless measurements justify it.
 
-A query such as:
+---
+
+## 14. Exact text and ALPR
+
+Example:
 
 ```text
 blue car with license plate XXX-YYY-ZZZ
 ```
 
-contains two different retrieval signals:
+This contains two signals:
 
-- semantic visual concepts: `blue car`;
-- exact/fuzzy text identity: `XXX-YYY-ZZZ`.
+```text
+blue car        -> semantic visual retrieval
+XXX-YYY-ZZZ     -> exact/fuzzy text identity
+```
 
-The visual index should first produce candidate frames/windows. A later ALPR/OCR stage can then extract plate text from candidate media and support exact/fuzzy matching.
+Planned path:
 
-Do not force exact identifiers into the CLIP similarity score.
+```text
+semantic candidate retrieval
+    ↓
+candidate frames/windows
+    ↓
+plate/text localization
+    ↓
+OCR / ALPR
+    ↓
+normalized exact/fuzzy match
+    ↓
+combined ranking
+```
 
-The search layer will eventually combine visual score + structured exact/fuzzy evidence.
+Do not rely on CLIP similarity to reproduce exact characters reliably.
 
-## 9. Temporal actions
+Whether ALPR later becomes an offline enrichment index or remains mostly candidate-time refinement should be decided from performance measurements.
 
-A query such as:
+---
+
+## 15. Temporal/action understanding
+
+Example:
 
 ```text
 red car running a red light
 ```
 
-cannot be proven by one isolated image. It requires a temporal model or deterministic temporal analysis over several frames.
+A single image containing a red car and a red traffic light does not prove the action.
 
-The intended architecture is:
+Planned path:
 
 ```text
-semantic visual retrieval
+visual semantic candidates
     ↓
 candidate temporal windows
     ↓
-dense decode / track local motion if useful
+dense multi-frame representation
     ↓
-temporal action reasoning
+temporal verification/reasoning
     ↓
-rerank / verify
+rerank
 ```
 
-Tracking can be introduced **inside a candidate window as a refinement technique** without becoming a prerequisite for the global semantic index. This preserves the class-agnostic design.
+Candidate-local tracking is allowed as one possible verification tool. It must not become the global prerequisite that determines which concepts are indexable.
 
-## 10. Optional generated descriptions
+Possible research tracks include:
 
-A future VLM can generate textual descriptions of candidate windows. Their text embeddings may be indexed separately and fused with visual retrieval.
+- video/multiframe embedding models;
+- VLM reasoning over selected frames;
+- local motion/tracking + explicit event logic;
+- combinations of the above.
 
-This is optional enrichment, not required for Winston's core `text -> image` semantic search.
+---
 
-If introduced, visual and description retrieval scores must be calibrated/fused deliberately rather than assumed to be directly comparable.
+## 16. Optional generated descriptions
 
-## 11. CLI and API boundaries
+A future VLM may generate descriptions for frames/regions/windows.
 
-The first product interface is CLI-oriented:
+Those descriptions can be embedded separately and fused with direct visual retrieval:
+
+```text
+query -> visual embedding search
+query -> description embedding search
+      -> score fusion/reranking
+```
+
+This remains optional enrichment. Winston's core visual search must work without descriptions.
+
+---
+
+## 17. Interfaces
+
+V0 is CLI-first:
 
 ```text
 winston scan <path>
@@ -454,84 +599,91 @@ winston index <path>
 winston search "woman with a pink stroller"
 ```
 
-A web/API layer comes after the algorithm has measurable quality on a fixed dataset.
+Only after search quality is demonstrated should a stable HTTP API be added.
 
-Later, an API can expose asset ingestion, indexing status, semantic search and result media endpoints without moving ML/indexing responsibilities into the web layer.
-
-## 12. Dataset acquisition
-
-`feat/public-stream-recorder` remains a separate one-shot acquisition utility:
+Potential later API:
 
 ```text
-public HLS sources
-    ↓
-scripts/stream_recorder
-    ↓
-hourly MKV dataset
-    ↓
-Winston offline ingestion/indexing
+POST /assets
+POST /index
+GET  /index/{job_id}
+POST /search
+GET  /media/{asset_id}
 ```
 
-It is useful for building realistic evaluation/training datasets, but Winston's core runtime must also work with arbitrary local files that were not produced by this script.
+A frontend comes after the backend/search contract is useful and stable.
 
-## 13. Evaluation strategy
+---
 
-Winston needs a reproducible test/evaluation dataset before optimization decisions are trusted.
+## 18. Deployment shape
 
-The evaluation set should contain concepts intentionally absent from any predefined class list, including small and compositional targets. Example query families:
+V0:
+
+```text
+host
+├── Winston Python CLI/process
+├── FFmpeg + ffprobe
+├── local recorded-media dataset
+└── Docker Compose
+    └── Qdrant
+```
+
+No Kubernetes, auth system, distributed queue, frontend, or live-camera service is necessary for the first algorithmic milestone.
+
+---
+
+## 19. Evaluation
+
+A fixed evaluation dataset must be created before optimizing architecture choices.
+
+Initial query families should intentionally include concepts not represented by any predefined class list:
 
 ```text
 pink stroller
 person wearing a green cap
 person carrying a cardboard box
 red bicycle
-blue car
-person with an umbrella
+umbrella
 ```
 
-Later evaluation families add:
+Later suites add:
 
 ```text
-exact license plates     # OCR/ALPR phase
-temporal actions         # temporal phase
+license plates   # OCR/ALPR
+multi-frame actions
 ```
 
 Track at minimum:
 
-- Recall@K for known relevant media;
+- Recall@K;
 - Precision@K;
-- indexing throughput (minutes of footage indexed per wall-clock minute);
-- total vector count per hour of video;
-- Qdrant search latency;
+- indexing throughput;
+- vectors per hour of video;
+- Qdrant query latency;
 - refinement latency.
 
-Performance optimization is only accepted when retrieval quality is measured alongside throughput.
+Any speed optimization that reduces recall must be visible in these metrics.
 
-## 14. Initial deployment shape
+---
 
-For V0:
+## 20. Definition of the core design
+
+The core Winston architecture is:
 
 ```text
-host machine
-├── Winston Python process / CLI
-├── FFmpeg + ffprobe
-├── local dataset filesystem
-└── Docker Compose
-    └── Qdrant
+recorded media
+    ↓
+class-agnostic sparse visual sampling
+    ↓
+Jina CLIP v1 image embeddings
+    ↓
+Qdrant
+    ↑
+Jina CLIP v1 text query
+    ↓
+semantic candidate windows
+    ↓
+specialized refinement only where necessary
 ```
 
-No Kubernetes, distributed queue, web frontend, authentication or live-camera service is required for the first algorithmic milestone.
-
-## 15. Architectural invariants to protect
-
-Future PRs should preserve these rules unless an explicit design decision replaces them:
-
-- baseline indexing does not require object classification;
-- baseline indexing does not require tracking;
-- a `region` is deterministic image geometry, not a detector-defined bounding box;
-- video sampling is replaceable behind a sampler abstraction;
-- raw media remains outside Qdrant;
-- query and image vectors must come from compatible multimodal embedding spaces;
-- model/preprocessing changes require reindexing;
-- exact text and temporal actions are specialized stages layered on top of semantic candidate retrieval;
-- one-shot dataset acquisition scripts stay outside `src/winston` runtime code.
+The essential property is that a future search concept does not need to have been anticipated when the media was indexed.
