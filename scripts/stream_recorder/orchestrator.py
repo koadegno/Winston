@@ -1,10 +1,13 @@
+"""Coordinate stream discovery, metadata persistence, retries, and camera recorders."""
+
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
+import asyncio
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import json
 from pathlib import Path
-import time
+from typing import Any
 
 from .discovery import discover_page
 from .hls import HlsVariant, resolve_cameras
@@ -15,25 +18,47 @@ from .sources import Source
 
 @dataclass(frozen=True, slots=True)
 class Camera:
+    """Bind a deterministic camera identifier to one resolved HLS stream."""
+
     id: str
     stream: HlsVariant
 
 
 def assign_camera_ids(streams: list[HlsVariant]) -> list[Camera]:
+    """Assign stable-in-order camera IDs after sorting resolved stream URLs."""
     ordered = sorted(streams, key=lambda stream: stream.url)
-    return [Camera(id=f"camera-{index:03d}", stream=stream) for index, stream in enumerate(ordered, start=1)]
+    return [
+        Camera(id=f"camera-{index:03d}", stream=stream)
+        for index, stream in enumerate(ordered, start=1)
+    ]
 
 
-def discover_source_cameras(source: Source, use_browser_fallback: bool = True) -> list[Camera]:
-    candidates = discover_page(source.url, use_browser_fallback=use_browser_fallback)
-    return assign_camera_ids(resolve_cameras(candidates))
+async def discover_source_cameras(
+    source: Source,
+    use_browser_fallback: bool = True,
+    *,
+    browser: Any | None = None,
+) -> list[Camera]:
+    """Discover and resolve every logical HLS camera exposed by one source page."""
+    candidates = await discover_page(
+        source.url,
+        use_browser_fallback=use_browser_fallback,
+        browser=browser,
+    )
+    return assign_camera_ids(await resolve_cameras(candidates))
 
 
 def _source_dir(output_root: Path, source: Source) -> Path:
+    """Return the root directory used to persist one source's recordings."""
     return output_root / Path(source.slug)
 
 
-def write_source_metadata(output_root: Path, source: Source, cameras: list[Camera]) -> None:
+def write_source_metadata(
+    output_root: Path,
+    source: Source,
+    cameras: list[Camera],
+) -> None:
+    """Persist source metadata and initialize metadata for all discovered cameras."""
     now = datetime.now(timezone.utc).isoformat()
     source_dir = _source_dir(output_root, source)
     write_json_atomic(
@@ -56,15 +81,19 @@ def write_camera_metadata(
     *,
     first_seen: str | None = None,
 ) -> None:
+    """Persist current camera stream metadata while preserving its first-seen time."""
     camera_path = _source_dir(output_root, source) / "cameras" / camera.id / "camera.json"
     existing_first_seen = first_seen
     if camera_path.exists():
         try:
-            import json
+            existing_first_seen = (
+                json.loads(camera_path.read_text(encoding="utf-8")).get("first_seen")
+                or first_seen
+            )
+        except (OSError, ValueError, TypeError):
+            # Corrupt metadata should be replaced rather than stopping a live recorder.
+            existing_first_seen = first_seen
 
-            existing_first_seen = json.loads(camera_path.read_text(encoding="utf-8")).get("first_seen") or first_seen
-        except Exception:
-            pass
     now = datetime.now(timezone.utc).isoformat()
     write_json_atomic(
         camera_path,
@@ -81,48 +110,76 @@ def write_camera_metadata(
     )
 
 
-def _rediscover_camera(source: Source, camera_id: str) -> Camera | None:
-    cameras = discover_source_cameras(source)
-    for camera in cameras:
-        if camera.id == camera_id:
-            return camera
-    return None
+async def _rediscover_camera(
+    source: Source,
+    camera_id: str,
+    *,
+    browser: Any | None = None,
+) -> Camera | None:
+    """Re-run source discovery and return the camera matching ``camera_id``."""
+    cameras = await discover_source_cameras(source, browser=browser)
+    return next((camera for camera in cameras if camera.id == camera_id), None)
 
 
-def record_camera_loop(
+async def record_camera_loop(
     source: Source,
     camera_id: str,
     initial_stream: HlsVariant,
     output_root: Path,
     *,
+    browser: Any | None = None,
     retry_seconds: float = 10.0,
     max_cycles: int | None = None,
 ) -> None:
+    """Continuously record one camera and rediscover its HLS URL after failures."""
     stream = initial_stream
     cycles = 0
     while max_cycles is None or cycles < max_cycles:
         cycles += 1
         camera = Camera(camera_id, stream)
         write_camera_metadata(output_root, source, camera)
-        returncode = record_one_hour_slice(stream.url, output_root, source.slug, camera_id)
+        returncode = await record_one_hour_slice(
+            stream.url,
+            output_root,
+            source.slug,
+            camera_id,
+        )
         if returncode == 0:
             continue
 
-        time.sleep(retry_seconds)
-        replacement = _rediscover_camera(source, camera_id)
+        # Async sleep keeps every other source and camera recording during backoff.
+        await asyncio.sleep(retry_seconds)
+        replacement = await _rediscover_camera(
+            source,
+            camera_id,
+            browser=browser,
+        )
         if replacement is not None:
             stream = replacement.stream
 
 
-def record_source_forever(source: Source, output_root: Path) -> None:
-    cameras = discover_source_cameras(source)
+async def record_source_forever(
+    source: Source,
+    output_root: Path,
+    *,
+    browser: Any | None = None,
+) -> None:
+    """Discover one source and run all of its camera recorders concurrently."""
+    cameras = await discover_source_cameras(source, browser=browser)
     if not cameras:
         raise RuntimeError(f"No HLS stream found for {source.url}")
+
     write_source_metadata(output_root, source, cameras)
-    with ThreadPoolExecutor(max_workers=len(cameras), thread_name_prefix=f"source-{source.id}") as pool:
-        futures = [
-            pool.submit(record_camera_loop, source, camera.id, camera.stream, output_root)
+    # Camera loops are independent long-lived jobs and must start together.
+    await asyncio.gather(
+        *(
+            record_camera_loop(
+                source,
+                camera.id,
+                camera.stream,
+                output_root,
+                browser=browser,
+            )
             for camera in cameras
-        ]
-        for future in futures:
-            future.result()
+        )
+    )

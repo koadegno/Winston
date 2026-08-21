@@ -7,11 +7,15 @@ on:
     paths:
       - 'scripts/stream_recorder/**'
       - 'tests/scripts/stream_recorder/**'
+      - 'pyproject.toml'
+      - 'uv.lock'
       - '.github/workflows/stream-recorder.yml'
   pull_request:
     paths:
       - 'scripts/stream_recorder/**'
       - 'tests/scripts/stream_recorder/**'
+      - 'pyproject.toml'
+      - 'uv.lock'
       - '.github/workflows/stream-recorder.yml'
   workflow_dispatch:
 
@@ -24,28 +28,52 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.13'
-      - name: Install test dependencies
-        run: python -m pip install pytest pyxlsb playwright
+      - name: Install project and script dependencies
+        run: python -m pip install -e '.[script]'
       - name: Run unit and local integration tests
         run: python -m pytest tests/scripts/stream_recorder -q
       - name: Install Chromium
         run: python -m playwright install --with-deps chromium
-      - name: Discover Brussels Grand Place HLS webcam
+      - name: Discover Brussels and Prijedor HLS webcams
+        shell: bash
         run: |
+          set -euo pipefail
+
           timeout 90s python -m scripts.stream_recorder.main discover \
             --url 'https://www.brussels.be/webcam-grand-place' \
             --candidates-only \
-            > /tmp/discovery.json
-          cat /tmp/discovery.json
+            > /tmp/brussels.json &
+          brussels_pid=$!
+
+          timeout 90s python -m scripts.stream_recorder.main discover \
+            --url 'https://www.prijedorgrad.org/sr-BA/gradsko-oko-live.html' \
+            --candidates-only \
+            > /tmp/prijedor.json &
+          prijedor_pid=$!
+
+          wait "$brussels_pid"
+          wait "$prijedor_pid"
+
+          cat /tmp/brussels.json
+          cat /tmp/prijedor.json
+
           python - <<'PY'
           import json
           from pathlib import Path
           from urllib.parse import urlparse
 
-          result = json.loads(Path('/tmp/discovery.json').read_text())
-          candidates = result['candidates']
-          assert candidates, 'No .m3u8 candidate discovered from the Brussels Grand Place webcam'
-          assert all('.m3u8' in url.lower() for url in candidates)
-          assert any(urlparse(url).hostname == 'livecam.brucity.be' for url in candidates), candidates
-          print(f"discovered_m3u8={len(candidates)}")
+          brussels = json.loads(Path('/tmp/brussels.json').read_text())['candidates']
+          prijedor = json.loads(Path('/tmp/prijedor.json').read_text())['candidates']
+
+          assert brussels, 'No .m3u8 candidate discovered from Brussels Grand Place'
+          assert any(urlparse(url).hostname == 'livecam.brucity.be' for url in brussels), brussels
+
+          ipcamlive = {
+              url for url in prijedor
+              if (urlparse(url).hostname or '').endswith('ipcamlive.com')
+          }
+          assert len(ipcamlive) >= 2, prijedor
+
+          print(f'brussels_m3u8={len(brussels)}')
+          print(f'prijedor_ipcamlive_m3u8={len(ipcamlive)}')
           PY

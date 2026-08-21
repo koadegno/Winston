@@ -2,12 +2,17 @@ from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from threading import Thread
 
+import pytest
+
 from scripts.stream_recorder.orchestrator import discover_source_cameras
 from scripts.stream_recorder.sources import Source
 
 
 class Handler(BaseHTTPRequestHandler):
+    """Serve a synthetic page, master playlist, and media playlists."""
+
     def do_GET(self):
+        """Return deterministic HLS fixtures for the local integration test."""
         if self.path == "/page":
             body = b'<script>const stream="/master.m3u8";</script>'
             content_type = "text/html"
@@ -28,11 +33,13 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def log_message(self, *_args):
+        """Suppress noisy local HTTP request logs during tests."""
         return
 
 
 @contextmanager
 def server():
+    """Run the local HLS fixture server in a background thread."""
     httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     thread = Thread(target=httpd.serve_forever, daemon=True)
     thread.start()
@@ -43,10 +50,12 @@ def server():
         thread.join()
 
 
-def test_discovers_master_and_selects_best_variant():
+@pytest.mark.asyncio
+async def test_discovers_master_and_selects_best_variant():
+    """Local end-to-end discovery selects the highest-resolution master variant."""
     with server() as port:
         source = Source("1", "Square", "City", "Country", f"http://127.0.0.1:{port}/page")
-        cameras = discover_source_cameras(source, use_browser_fallback=False)
+        cameras = await discover_source_cameras(source, use_browser_fallback=False)
     assert len(cameras) == 1
     assert cameras[0].stream.resolution == (1920, 1080)
     assert cameras[0].stream.url.endswith("/high.m3u8")
