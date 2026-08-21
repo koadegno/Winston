@@ -6,11 +6,12 @@ from fractions import Fraction
 from pathlib import Path
 from typing import cast
 
-from winston.config import settings
+from pydantic import JsonValue
+
+from winston.config import get_config
 from winston.ingest.models import ImageMetadata, MediaFile, MediaMetadata, MediaType, VideoMetadata
 
 
-type JsonValue = str | int | float | bool | None | list["JsonValue"] | dict[str, "JsonValue"]
 type JsonObject = dict[str, JsonValue]
 
 
@@ -20,10 +21,12 @@ class MediaProbeError(RuntimeError):
 
 def run_ffprobe(path: Path) -> JsonObject:
     """Run ffprobe for the first visual stream and return its JSON metadata."""
+    config = get_config()
+
     # Images are exposed by ffprobe as a video stream too, so the same command
     # can inspect both supported media types.
     command = [
-        settings.ffprobe_binary,
+        config.ffprobe_binary,
         "-v",
         "error",
         "-select_streams",
@@ -38,13 +41,13 @@ def run_ffprobe(path: Path) -> JsonObject:
     try:
         result = subprocess.run(command, capture_output=True, text=True, check=True)
     except FileNotFoundError as exc:
-        raise MediaProbeError(f"ffprobe executable not found: {settings.ffprobe_binary}") from exc
+        raise MediaProbeError(f"ffprobe executable not found: {config.ffprobe_binary}") from exc
     except subprocess.CalledProcessError as exc:
         message = exc.stderr.strip() or "ffprobe returned a non-zero exit status"
         raise MediaProbeError(message) from exc
 
     try:
-        payload: JsonValue = json.loads(result.stdout)
+        payload = cast(JsonValue, json.loads(result.stdout))
     except json.JSONDecodeError as exc:
         raise MediaProbeError("ffprobe returned invalid JSON") from exc
 
@@ -54,6 +57,7 @@ def run_ffprobe(path: Path) -> JsonObject:
 
 
 def _video_stream(path: Path, payload: JsonObject) -> JsonObject:
+    """Return the first visual stream from an ffprobe payload."""
     streams = payload.get("streams")
     if not isinstance(streams, list) or not streams or not isinstance(streams[0], dict):
         raise MediaProbeError(f"No video stream found in {path}")
@@ -61,6 +65,7 @@ def _video_stream(path: Path, payload: JsonObject) -> JsonObject:
 
 
 def _integer_field(path: Path, stream: JsonObject, name: str) -> int:
+    """Read an integer-valued field from an ffprobe stream."""
     value = stream.get(name)
     if isinstance(value, bool) or not isinstance(value, (int, float, str)):
         raise MediaProbeError(f"Invalid {name} in ffprobe metadata for {path}")
@@ -71,6 +76,7 @@ def _integer_field(path: Path, stream: JsonObject, name: str) -> int:
 
 
 def _frame_rate(path: Path, stream: JsonObject) -> float:
+    """Return a positive frame rate, preferring average rate over raw rate."""
     # avg_frame_rate is the best representation for playback; some files expose
     # only r_frame_rate, so retain that as a fallback.
     for field in ("avg_frame_rate", "r_frame_rate"):
