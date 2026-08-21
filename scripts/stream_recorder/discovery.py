@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from html.parser import HTMLParser
 import re
 import ssl
@@ -62,17 +63,28 @@ def fetch_text(url: str, timeout: float = 20.0) -> tuple[str, str]:
     return body, final_url
 
 
-def discover_http(url: str, iframe_depth: int = 1) -> set[str]:
+def _discover_iframe(iframe_url: str, timeout: float) -> set[str]:
+    iframe_body, iframe_final_url = fetch_text(iframe_url, timeout=timeout)
+    return extract_m3u8_urls(iframe_body, iframe_final_url)
+
+
+def discover_http(url: str, iframe_depth: int = 1, iframe_timeout: float = 8.0) -> set[str]:
     body, final_url = fetch_text(url)
     streams = extract_m3u8_urls(body, final_url)
     if iframe_depth <= 0:
         return streams
-    for iframe_url in extract_iframe_urls(body, final_url):
-        try:
-            iframe_body, iframe_final_url = fetch_text(iframe_url)
-        except Exception:
-            continue
-        streams.update(extract_m3u8_urls(iframe_body, iframe_final_url))
+
+    iframe_urls = extract_iframe_urls(body, final_url)
+    if not iframe_urls:
+        return streams
+
+    with ThreadPoolExecutor(max_workers=min(len(iframe_urls), 8), thread_name_prefix="iframe-scan") as pool:
+        futures = [pool.submit(_discover_iframe, iframe_url, iframe_timeout) for iframe_url in iframe_urls]
+        for future in as_completed(futures):
+            try:
+                streams.update(future.result())
+            except Exception:
+                continue
     return streams
 
 
@@ -85,17 +97,19 @@ def discover_browser(url: str, timeout_ms: int = 20_000, settle_ms: int = 5_000)
     streams: set[str] = set()
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch(headless=True)
-        page = browser.new_page()
+        try:
+            page = browser.new_page()
 
-        def collect(request) -> None:
-            if ".m3u8" in request.url.lower():
-                streams.add(request.url)
+            def collect(request) -> None:
+                if ".m3u8" in request.url.lower():
+                    streams.add(request.url)
 
-        page.on("request", collect)
-        page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
-        page.wait_for_timeout(settle_ms)
-        streams.update(extract_m3u8_urls(page.content(), page.url))
-        browser.close()
+            page.on("request", collect)
+            page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+            page.wait_for_timeout(settle_ms)
+            streams.update(extract_m3u8_urls(page.content(), page.url))
+        finally:
+            browser.close()
     return streams
 
 
