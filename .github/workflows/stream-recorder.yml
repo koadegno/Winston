@@ -30,19 +30,24 @@ jobs:
         run: python -m pytest tests/scripts/stream_recorder -q
       - name: Install Chromium
         run: python -m playwright install --with-deps chromium
-      - name: Discover a real public HLS webcam
+      - name: Diagnose real public webcam discovery layers
         run: |
-          timeout 60s python -m scripts.stream_recorder.main discover \
-            --url 'https://webcamsittard.nl/' \
-            --candidates-only \
-            > /tmp/discovery.json
-          cat /tmp/discovery.json
-          python - <<'PY'
-          import json
-          from pathlib import Path
-
-          result = json.loads(Path('/tmp/discovery.json').read_text())
-          assert result['candidates'], 'No .m3u8 candidate discovered from the public webcam page'
-          assert all('.m3u8' in url.lower() for url in result['candidates'])
-          print(f"discovered_m3u8={len(result['candidates'])}")
+          set +e
+          timeout 30s python -u - <<'PY'
+          from scripts.stream_recorder.discovery import discover_http
+          url = 'https://webcamsittard.nl/'
+          print('HTTP_START', flush=True)
+          print(sorted(discover_http(url)), flush=True)
+          print('HTTP_DONE', flush=True)
           PY
+          echo "HTTP_RC=$?"
+
+          timeout 30s python -u - <<'PY'
+          from scripts.stream_recorder.discovery import discover_browser
+          url = 'https://webcamsittard.nl/'
+          print('BROWSER_START', flush=True)
+          print(sorted(discover_browser(url)), flush=True)
+          print('BROWSER_DONE', flush=True)
+          PY
+          echo "BROWSER_RC=$?"
+          exit 1
