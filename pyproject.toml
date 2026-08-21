@@ -4,4 +4,8 @@ version = "0.1.0"
 description = "Find anything in video footage with natural-language search and multimodal embeddings."
 readme = "README.md"
 requires-python = ">=3.13"
-dependencies = ["pydantic>=2.13.4", "pydantic-settings>=2.15.0"]
+dependencies = [
+    "pydantic>=2.13.4",
+    "pydantic-settings>=2.15.0",
+    "pytest>=9.1.1",
+]
