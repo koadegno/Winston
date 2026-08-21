@@ -13,7 +13,7 @@ from urllib.request import Request, urlopen
 
 
 _M3U8_RE = re.compile(
-    r"(?P<url>(?:https?:)?(?:\\?/[^^\s'\"<>]*)?[^\s'\"<>]*?\.m3u8(?:\?[^\s'\"<>]*)?)".replace("[^^", "[^") ,
+    r"(?P<url>(?:https?:)?(?:\\?/[^\s'\"<>]*)?[^\s'\"<>]*?\.m3u8(?:\?[^\s'\"<>]*)?)",
     re.IGNORECASE,
 )
 
