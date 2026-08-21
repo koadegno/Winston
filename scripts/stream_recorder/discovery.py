@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections import deque
+from collections.abc import Callable
 import re
 import ssl
 from urllib.parse import urljoin
@@ -26,14 +28,31 @@ def extract_m3u8_urls(text: str, base_url: str) -> set[str]:
     return urls
 
 
-def extract_rendered_frame_m3u8_urls(frames, *, timeout_ms: int = 1_500) -> set[str]:
+def crawl_browser_targets(
+    root_url: str,
+    visit: Callable[[str], tuple[set[str], set[str]]],
+    *,
+    max_iframe_depth: int = 2,
+) -> set[str]:
     streams: set[str] = set()
-    for frame in frames:
-        try:
-            html = frame.locator("html").inner_html(timeout=timeout_ms)
-            streams.update(extract_m3u8_urls(html, frame.url))
-        except Exception:
+    seen: set[str] = set()
+    pending = deque([(root_url, 0)])
+
+    while pending:
+        target_url, depth = pending.popleft()
+        if target_url in seen:
             continue
+        seen.add(target_url)
+
+        target_streams, iframe_urls = visit(target_url)
+        streams.update(target_streams)
+
+        if depth >= max_iframe_depth:
+            continue
+        for iframe_url in sorted(iframe_urls):
+            if iframe_url not in seen:
+                pending.append((iframe_url, depth + 1))
+
     return streams
 
 
@@ -58,29 +77,59 @@ def discover_http(url: str) -> set[str]:
     return extract_m3u8_urls(body, final_url)
 
 
-def discover_browser(url: str, timeout_ms: int = 20_000, settle_ms: int = 5_000) -> set[str]:
+def _iframe_urls(page) -> set[str]:
+    urls = page.locator("iframe").evaluate_all(
+        "elements => elements.map(element => element.src).filter(Boolean)"
+    )
+    return {url for url in urls if isinstance(url, str) and url.startswith(("http://", "https://"))}
+
+
+def _visit_browser_target(browser, url: str, *, timeout_ms: int, settle_ms: int) -> tuple[set[str], set[str]]:
+    streams: set[str] = set()
+    context = browser.new_context()
+    try:
+        page = context.new_page()
+
+        def collect(request) -> None:
+            if ".m3u8" in request.url.lower():
+                streams.add(request.url)
+
+        page.on("request", collect)
+        page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+        page.wait_for_timeout(settle_ms)
+        return streams, _iframe_urls(page)
+    finally:
+        context.close()
+
+
+def discover_browser(
+    url: str,
+    timeout_ms: int = 20_000,
+    settle_ms: int = 5_000,
+    max_iframe_depth: int = 2,
+) -> set[str]:
     try:
         from playwright.sync_api import sync_playwright
     except ImportError as exc:
         raise RuntimeError("playwright is required for browser-based stream discovery") from exc
 
-    streams: set[str] = set()
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch(headless=True)
         try:
-            page = browser.new_page()
+            def visit(target_url: str) -> tuple[set[str], set[str]]:
+                try:
+                    return _visit_browser_target(
+                        browser,
+                        target_url,
+                        timeout_ms=timeout_ms,
+                        settle_ms=settle_ms,
+                    )
+                except Exception:
+                    return set(), set()
 
-            def collect(request) -> None:
-                if ".m3u8" in request.url.lower():
-                    streams.add(request.url)
-
-            page.on("request", collect)
-            page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
-            page.wait_for_timeout(settle_ms)
-            streams.update(extract_rendered_frame_m3u8_urls(page.frames))
+            return crawl_browser_targets(url, visit, max_iframe_depth=max_iframe_depth)
         finally:
             browser.close()
-    return streams
 
 
 def discover_page(url: str, use_browser_fallback: bool = True) -> set[str]:
