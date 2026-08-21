@@ -1,6 +1,6 @@
 # Public stream recorder
 
-One-shot dataset collection tooling for Winston. It discovers public HLS webcam streams and records them into hourly MKV files.
+One-shot dataset collection tooling for Winston. It discovers public HLS webcam streams and records them into UTC hour-aligned MKV files.
 
 YouTube and YouTube Live are intentionally unsupported.
 
@@ -8,49 +8,68 @@ YouTube and YouTube Live are intentionally unsupported.
 
 - Python 3.13+
 - FFmpeg available on `PATH`
-- `pyxlsb`
-- Playwright + Chromium for JavaScript-driven players
+- the `script` optional dependencies from `pyproject.toml`
+- Playwright Chromium for JavaScript-driven players
 
-With `uv`, the one-shot dependencies can stay outside Winston's runtime dependencies:
+Install the project and the one-shot script dependencies with `uv`:
 
 ```bash
-uv run --with pyxlsb --with playwright python -m playwright install chromium
+uv sync --extra script
+uv run python -m playwright install chromium
 ```
+
+## Concurrency model
+
+Independent I/O is concurrent:
+
+- all source pages from `Place_Overview.xlsb` are discovered concurrently;
+- direct HTTP inspection and Playwright observation for one page run concurrently;
+- iframe/player URLs at the same depth are opened concurrently as isolated Playwright contexts;
+- all HLS candidates for a page are resolved concurrently;
+- all sources record concurrently;
+- all cameras belonging to a source record concurrently;
+- FFmpeg processes are awaited asynchronously, so one camera never blocks another.
+
+One Chromium process is shared across a multi-source command. Each source/player target gets an isolated browser context.
 
 ## Discover one page
 
 ```bash
-uv run --with pyxlsb --with playwright \
-  python -m scripts.stream_recorder.main discover \
+uv run python -m scripts.stream_recorder.main discover \
   --url 'https://example.com/public-webcam'
 ```
 
-The command prints JSON containing every candidate `.m3u8` and every resolved logical camera.
+The command prints progress to stderr and JSON to stdout. The JSON contains every candidate `.m3u8` and every resolved logical camera.
+
+To stop after finding `.m3u8` candidates without fetching the HLS playlists:
+
+```bash
+uv run python -m scripts.stream_recorder.main discover \
+  --url 'https://example.com/public-webcam' \
+  --candidates-only
+```
 
 ## Discover every supported source in Place_Overview.xlsb
 
 ```bash
-uv run --with pyxlsb --with playwright \
-  python -m scripts.stream_recorder.main discover \
+uv run python -m scripts.stream_recorder.main discover \
   --xlsb Place_Overview.xlsb
 ```
 
-YouTube rows are skipped automatically.
+All non-YouTube rows start concurrently. Completion progress is written immediately to stderr while the final deterministic JSON array remains on stdout.
 
 ## Record
 
 ```bash
-uv run --with pyxlsb --with playwright \
-  python -m scripts.stream_recorder.main record \
+uv run python -m scripts.stream_recorder.main record \
   --xlsb Place_Overview.xlsb \
   --output datasets/recordings
 ```
 
-Record only selected source ids:
+Record only selected source IDs:
 
 ```bash
-uv run --with pyxlsb --with playwright \
-  python -m scripts.stream_recorder.main record \
+uv run python -m scripts.stream_recorder.main record \
   --xlsb Place_Overview.xlsb \
   --source-id 61 \
   --source-id 82
