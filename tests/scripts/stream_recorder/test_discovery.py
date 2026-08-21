@@ -35,18 +35,31 @@ def test_http_discovery_leaves_iframe_loading_to_browser(monkeypatch):
     assert calls == ["https://example.test/page"]
 
 
+class _FakeLocator:
+    def __init__(self, content: str):
+        self._content = content
+
+    def inner_html(self, *, timeout: float) -> str:
+        assert timeout <= 2_000
+        return self._content
+
+
 class _FakeFrame:
     def __init__(self, url: str, content: str):
         self.url = url
         self._content = content
 
     def content(self) -> str:
-        return self._content
+        raise AssertionError("unbounded frame.content() must not be used")
+
+    def locator(self, selector: str) -> _FakeLocator:
+        assert selector == "html"
+        return _FakeLocator(self._content)
 
 
-def test_extracts_m3u8_from_rendered_child_frames():
+def test_extracts_m3u8_from_rendered_child_frames_with_bounded_dom_reads():
     frames = [
-        _FakeFrame("https://example.test/", "<html></html>"),
+        _FakeFrame("https://example.test/", "<body></body>"),
         _FakeFrame(
             "https://player.example/embed/123",
             '<script>window.stream="https://cdn.example/live/camera.m3u8?token=abc"</script>',
