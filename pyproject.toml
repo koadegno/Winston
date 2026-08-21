@@ -9,3 +9,9 @@ dependencies = [
     "pydantic-settings>=2.15.0",
     "pytest>=9.1.1",
 ]
+
+[project.optional-dependencies]
+script = [
+    "playwright>=1.62.0",
+    "pyxlsb>=1.0.10",
+]
