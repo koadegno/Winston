@@ -1,0 +1,48 @@
+name: Stream recorder
+
+on:
+  push:
+    branches:
+      - feat/public-stream-recorder
+    paths:
+      - 'scripts/stream_recorder/**'
+      - 'tests/scripts/stream_recorder/**'
+      - '.github/workflows/stream-recorder.yml'
+  pull_request:
+    paths:
+      - 'scripts/stream_recorder/**'
+      - 'tests/scripts/stream_recorder/**'
+      - '.github/workflows/stream-recorder.yml'
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install test dependencies
+        run: python -m pip install pytest pyxlsb playwright
+      - name: Run unit and local integration tests
+        run: python -m pytest tests/scripts/stream_recorder -q
+      - name: Install Chromium
+        run: python -m playwright install --with-deps chromium
+      - name: Discover a real public HLS webcam
+        run: |
+          python -m scripts.stream_recorder.main discover \
+            --url 'https://webcamsittard.nl/' \
+            > /tmp/discovery.json
+          cat /tmp/discovery.json
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          result = json.loads(Path('/tmp/discovery.json').read_text())
+          assert result['candidates'], 'No .m3u8 candidate discovered from the public webcam page'
+          assert result['cameras'], 'No live HLS camera resolved from discovered candidates'
+          assert all('.m3u8' in camera['stream_url'].lower() for camera in result['cameras'])
+          print(f"resolved_cameras={len(result['cameras'])}")
+          PY
