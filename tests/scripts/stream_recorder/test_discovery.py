@@ -1,6 +1,8 @@
-from threading import Barrier
-
-from scripts.stream_recorder.discovery import discover_http, extract_m3u8_urls
+from scripts.stream_recorder.discovery import (
+    discover_http,
+    extract_m3u8_urls,
+    extract_rendered_frame_m3u8_urls,
+)
 
 
 def test_extracts_absolute_relative_and_escaped_m3u8_urls():
@@ -17,20 +19,40 @@ def test_extracts_absolute_relative_and_escaped_m3u8_urls():
     }
 
 
-def test_discover_http_fetches_iframes_concurrently(monkeypatch):
-    barrier = Barrier(2)
-    page = '<iframe src="/cam-a"></iframe><iframe src="/cam-b"></iframe>'
+def test_http_discovery_leaves_iframe_loading_to_browser(monkeypatch):
+    calls: list[str] = []
+    page = '<iframe src="https://third-party.example/player"></iframe>'
 
     def fake_fetch(url: str, timeout: float = 20.0):
-        if url == "https://example.test/page":
-            return page, url
-        barrier.wait(timeout=0.5)
-        camera_name = url.rsplit("/", 1)[-1]
-        return f'https://cdn.example/{camera_name}.m3u8', url
+        calls.append(url)
+        if url != "https://example.test/page":
+            raise AssertionError("HTTP discovery must not fetch third-party iframes")
+        return page, url
 
     monkeypatch.setattr("scripts.stream_recorder.discovery.fetch_text", fake_fetch)
 
-    assert discover_http("https://example.test/page") == {
-        "https://cdn.example/cam-a.m3u8",
-        "https://cdn.example/cam-b.m3u8",
+    assert discover_http("https://example.test/page") == set()
+    assert calls == ["https://example.test/page"]
+
+
+class _FakeFrame:
+    def __init__(self, url: str, content: str):
+        self.url = url
+        self._content = content
+
+    def content(self) -> str:
+        return self._content
+
+
+def test_extracts_m3u8_from_rendered_child_frames():
+    frames = [
+        _FakeFrame("https://example.test/", "<html></html>"),
+        _FakeFrame(
+            "https://player.example/embed/123",
+            '<script>window.stream="https://cdn.example/live/camera.m3u8?token=abc"</script>',
+        ),
+    ]
+
+    assert extract_rendered_frame_m3u8_urls(frames) == {
+        "https://cdn.example/live/camera.m3u8?token=abc"
     }
