@@ -1,8 +1,5 @@
-from scripts.stream_recorder.discovery import (
-    discover_http,
-    extract_m3u8_urls,
-    extract_rendered_frame_m3u8_urls,
-)
+import scripts.stream_recorder.discovery as discovery
+from scripts.stream_recorder.discovery import discover_http, extract_m3u8_urls
 
 
 def test_extracts_absolute_relative_and_escaped_m3u8_urls():
@@ -35,37 +32,21 @@ def test_http_discovery_leaves_iframe_loading_to_browser(monkeypatch):
     assert calls == ["https://example.test/page"]
 
 
-class _FakeLocator:
-    def __init__(self, content: str):
-        self._content = content
+def test_browser_discovery_visits_iframe_urls_as_independent_targets():
+    root_url = "https://example.test/webcam"
+    player_url = "https://player.example/embed/123"
+    stream_url = "https://cdn.example/live/camera.m3u8"
+    visited: list[str] = []
 
-    def inner_html(self, *, timeout: float) -> str:
-        assert timeout <= 2_000
-        return self._content
+    def visit(url: str) -> tuple[set[str], set[str]]:
+        visited.append(url)
+        if url == root_url:
+            return set(), {player_url}
+        if url == player_url:
+            return {stream_url}, set()
+        raise AssertionError(f"unexpected target: {url}")
 
-
-class _FakeFrame:
-    def __init__(self, url: str, content: str):
-        self.url = url
-        self._content = content
-
-    def content(self) -> str:
-        raise AssertionError("unbounded frame.content() must not be used")
-
-    def locator(self, selector: str) -> _FakeLocator:
-        assert selector == "html"
-        return _FakeLocator(self._content)
-
-
-def test_extracts_m3u8_from_rendered_child_frames_with_bounded_dom_reads():
-    frames = [
-        _FakeFrame("https://example.test/", "<body></body>"),
-        _FakeFrame(
-            "https://player.example/embed/123",
-            '<script>window.stream="https://cdn.example/live/camera.m3u8?token=abc"</script>',
-        ),
-    ]
-
-    assert extract_rendered_frame_m3u8_urls(frames) == {
-        "https://cdn.example/live/camera.m3u8?token=abc"
-    }
+    crawl = getattr(discovery, "crawl_browser_targets", None)
+    assert crawl is not None, "isolated browser target crawler is not implemented"
+    assert crawl(root_url, visit, max_iframe_depth=1) == {stream_url}
+    assert visited == [root_url, player_url]
