@@ -1,18 +1,27 @@
+"""Read image and video metadata through ffprobe."""
+
 import json
 import subprocess
 from fractions import Fraction
 from pathlib import Path
-from typing import Any
+from typing import cast
 
 from winston.config import settings
 from winston.ingest.models import ImageMetadata, MediaFile, MediaMetadata, MediaType, VideoMetadata
 
 
+type JsonValue = str | int | float | bool | None | list["JsonValue"] | dict[str, "JsonValue"]
+type JsonObject = dict[str, JsonValue]
+
+
 class MediaProbeError(RuntimeError):
-    pass
+    """Raised when ffprobe cannot provide valid metadata for a media file."""
 
 
-def run_ffprobe(path: Path) -> dict[str, Any]:
+def run_ffprobe(path: Path) -> JsonObject:
+    """Run ffprobe for the first visual stream and return its JSON metadata."""
+    # Images are exposed by ffprobe as a video stream too, so the same command
+    # can inspect both supported media types.
     command = [
         settings.ffprobe_binary,
         "-v",
@@ -35,33 +44,38 @@ def run_ffprobe(path: Path) -> dict[str, Any]:
         raise MediaProbeError(message) from exc
 
     try:
-        payload = json.loads(result.stdout)
+        payload: JsonValue = json.loads(result.stdout)
     except json.JSONDecodeError as exc:
         raise MediaProbeError("ffprobe returned invalid JSON") from exc
 
     if not isinstance(payload, dict):
         raise MediaProbeError("ffprobe returned an unexpected JSON document")
-    return payload
+    return cast(JsonObject, payload)
 
 
-def _video_stream(path: Path, payload: dict[str, Any]) -> dict[str, Any]:
+def _video_stream(path: Path, payload: JsonObject) -> JsonObject:
     streams = payload.get("streams")
     if not isinstance(streams, list) or not streams or not isinstance(streams[0], dict):
         raise MediaProbeError(f"No video stream found in {path}")
     return streams[0]
 
 
-def _integer_field(path: Path, stream: dict[str, Any], name: str) -> int:
+def _integer_field(path: Path, stream: JsonObject, name: str) -> int:
+    value = stream.get(name)
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        raise MediaProbeError(f"Invalid {name} in ffprobe metadata for {path}")
     try:
-        return int(stream[name])
-    except (KeyError, TypeError, ValueError) as exc:
+        return int(value)
+    except ValueError as exc:
         raise MediaProbeError(f"Invalid {name} in ffprobe metadata for {path}") from exc
 
 
-def _frame_rate(path: Path, stream: dict[str, Any]) -> float:
+def _frame_rate(path: Path, stream: JsonObject) -> float:
+    # avg_frame_rate is the best representation for playback; some files expose
+    # only r_frame_rate, so retain that as a fallback.
     for field in ("avg_frame_rate", "r_frame_rate"):
         value = stream.get(field)
-        if not value:
+        if isinstance(value, bool) or not isinstance(value, (int, float, str)):
             continue
         try:
             rate = Fraction(str(value))
@@ -72,7 +86,8 @@ def _frame_rate(path: Path, stream: dict[str, Any]) -> float:
     raise MediaProbeError(f"Invalid frame rate in ffprobe metadata for {path}")
 
 
-def parse_probe(path: Path, media_type: MediaType, payload: dict[str, Any]) -> MediaMetadata:
+def parse_probe(path: Path, media_type: MediaType, payload: JsonObject) -> MediaMetadata:
+    """Convert validated ffprobe JSON into Winston media metadata."""
     stream = _video_stream(path, payload)
     width = _integer_field(path, stream, "width")
     height = _integer_field(path, stream, "height")
@@ -87,9 +102,13 @@ def parse_probe(path: Path, media_type: MediaType, payload: dict[str, Any]) -> M
     format_metadata = payload.get("format")
     if not isinstance(format_metadata, dict):
         raise MediaProbeError(f"Invalid format metadata for {path}")
+
+    duration_value = format_metadata.get("duration")
+    if isinstance(duration_value, bool) or not isinstance(duration_value, (int, float, str)):
+        raise MediaProbeError(f"Invalid duration in ffprobe metadata for {path}")
     try:
-        duration = float(format_metadata["duration"])
-    except (KeyError, TypeError, ValueError) as exc:
+        duration = float(duration_value)
+    except ValueError as exc:
         raise MediaProbeError(f"Invalid duration in ffprobe metadata for {path}") from exc
 
     return VideoMetadata(
@@ -103,6 +122,7 @@ def parse_probe(path: Path, media_type: MediaType, payload: dict[str, Any]) -> M
 
 
 def probe_media(media: MediaFile) -> MediaMetadata:
+    """Probe one media file and attach its path to any resulting error."""
     try:
         payload = run_ffprobe(media.path)
         return parse_probe(media.path, media.media_type, payload)
