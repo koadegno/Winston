@@ -26,11 +26,12 @@ def extract_m3u8_urls(text: str, base_url: str) -> set[str]:
     return urls
 
 
-def extract_rendered_frame_m3u8_urls(frames) -> set[str]:
+def extract_rendered_frame_m3u8_urls(frames, *, timeout_ms: int = 1_500) -> set[str]:
     streams: set[str] = set()
     for frame in frames:
         try:
-            streams.update(extract_m3u8_urls(frame.content(), frame.url))
+            html = frame.locator("html").inner_html(timeout=timeout_ms)
+            streams.update(extract_m3u8_urls(html, frame.url))
         except Exception:
             continue
     return streams
