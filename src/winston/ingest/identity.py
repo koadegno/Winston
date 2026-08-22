@@ -2,8 +2,9 @@
 
 from dataclasses import dataclass
 import hashlib
-import json
 from pathlib import Path
+
+from winston.utils.canonical import canonical_json
 
 ASSET_IDENTITY_PREFIX = "winston:asset:v1:"
 
@@ -38,12 +39,7 @@ def identify_asset(*, index_root: Path, source_path: Path) -> AssetIdentity:
         "mtime_ns": stat.st_mtime_ns,
         "relative_path": relative_path,
     }
-    canonical = json.dumps(
-        material,
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=False,
-    )
+    canonical = canonical_json(material)
     digest = hashlib.sha256(
         f"{ASSET_IDENTITY_PREFIX}{canonical}".encode("utf-8")
     ).hexdigest()
