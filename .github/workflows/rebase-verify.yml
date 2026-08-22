@@ -52,7 +52,7 @@ jobs:
         run: uv sync --locked --all-extras
 
       - name: Run Winston and recorder tests
-        run: uv run pytest -q tests/src/winston tests/scripts/stream_recorder
+        run: uv run python -m pytest -q tests/src/winston tests/scripts/stream_recorder
 
       - name: Compile Python sources
         run: uv run python -m compileall -q src/winston scripts/stream_recorder
