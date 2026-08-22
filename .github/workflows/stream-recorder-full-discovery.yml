@@ -6,12 +6,14 @@ on:
       - feat/public-stream-recorder
     paths:
       - '.github/workflows/stream-recorder-full-discovery.yml'
+      - 'Place_Overview.xlsb'
   pull_request:
     branches:
       - main
     paths:
       - '.github/workflows/stream-recorder-full-discovery.yml'
       - 'scripts/stream_recorder/**'
+      - 'Place_Overview.xlsb'
       - 'pyproject.toml'
       - 'uv.lock'
   workflow_dispatch:
@@ -33,21 +35,12 @@ jobs:
       - name: Install Chromium
         run: python -m playwright install --with-deps chromium
 
-      - name: Download official Place Overview workbook
+      - name: Verify repository Place Overview workbook
         shell: bash
         run: |
           set -euo pipefail
-          curl \
-            --fail \
-            --location \
-            --retry 8 \
-            --retry-all-errors \
-            --retry-delay 5 \
-            --output /tmp/Place_Overview.xlsb \
-            'https://zenodo.org/records/18267205/files/Place_Overview.xlsb?download=1'
-
-          echo '86be3ba9bd17fc4cfcc286517f79cd38  /tmp/Place_Overview.xlsb' | md5sum --check --strict
-          ls -lh /tmp/Place_Overview.xlsb
+          test -f Place_Overview.xlsb
+          ls -lh Place_Overview.xlsb
 
       - name: Discover every non-YouTube source from the workbook
         shell: bash
@@ -55,7 +48,7 @@ jobs:
           set -euo pipefail
 
           timeout 75m python -m scripts.stream_recorder.main discover \
-            --xlsb /tmp/Place_Overview.xlsb \
+            --xlsb Place_Overview.xlsb \
             --browser-concurrency 2 \
             > /tmp/full-discovery.json \
             2> >(tee /tmp/full-discovery.log >&2)
