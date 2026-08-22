@@ -41,7 +41,7 @@ async def test_http_discovery_leaves_iframe_loading_to_browser(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_browser_discovery_visits_iframe_urls_as_independent_targets():
-    """Browser crawling follows iframe URLs as isolated targets."""
+    """Browser crawling follows iframe URLs as isolated targets when the parent has no stream."""
     root_url = "https://example.test/webcam"
     player_url = "https://player.example/embed/123"
     stream_url = "https://cdn.example/live/camera.m3u8"
@@ -58,6 +58,25 @@ async def test_browser_discovery_visits_iframe_urls_as_independent_targets():
 
     assert await discovery.crawl_browser_targets(root_url, visit, max_iframe_depth=1) == {stream_url}
     assert visited == [root_url, player_url]
+
+
+@pytest.mark.asyncio
+async def test_browser_does_not_crawl_iframes_after_parent_finds_stream():
+    """A target that already exposes HLS must not enqueue its iframe children."""
+    root_url = "https://example.test/webcam"
+    child_url = "https://player.example/unnecessary"
+    stream_url = "https://cdn.example/live/camera.m3u8"
+    visited: list[str] = []
+
+    async def visit(url: str) -> tuple[set[str], set[str]]:
+        """Expose one stream and one irrelevant child from the root page."""
+        visited.append(url)
+        if url == root_url:
+            return {stream_url}, {child_url}
+        return set(), set()
+
+    assert await discovery.crawl_browser_targets(root_url, visit, max_iframe_depth=1) == {stream_url}
+    assert visited == [root_url]
 
 
 @pytest.mark.asyncio
@@ -83,36 +102,53 @@ async def test_browser_target_siblings_start_concurrently():
 
 
 @pytest.mark.asyncio
-async def test_http_and_browser_layers_run_concurrently(monkeypatch):
-    """Direct HTTP and browser observation start together for one source page."""
-    both_started = asyncio.Event()
-    started: set[str] = set()
+async def test_browser_is_skipped_when_http_already_finds_hls(monkeypatch):
+    """Direct HTML HLS discovery must avoid consuming a Playwright tab."""
+    calls: list[str] = []
     sentinel = object()
-
-    async def wait_for_peer(name: str, result: set[str]) -> set[str]:
-        """Wait until both independent discovery layers have entered."""
-        started.add(name)
-        if len(started) == 2:
-            both_started.set()
-        await asyncio.wait_for(both_started.wait(), timeout=0.1)
-        return result
+    stream_url = "https://example.test/direct.m3u8"
 
     async def fake_http(_url: str) -> set[str]:
-        """Simulate the direct HTTP layer."""
-        return await wait_for_peer("http", {"https://example.test/http.m3u8"})
+        """Return a stream directly from the HTML source."""
+        calls.append("http")
+        return {stream_url}
 
     async def fake_browser(_url: str, *, browser) -> set[str]:
-        """Simulate the browser network-observation layer."""
+        """Record any unnecessary browser fallback invocation."""
         assert browser is sentinel
-        return await wait_for_peer("browser", {"https://example.test/browser.m3u8"})
+        calls.append("browser")
+        return {"https://example.test/browser.m3u8"}
 
     monkeypatch.setattr(discovery, "discover_http", fake_http)
     monkeypatch.setattr(discovery, "discover_browser", fake_browser)
-    streams = await discovery.discover_page("https://example.test/page", browser=sentinel)
-    assert streams == {
-        "https://example.test/http.m3u8",
-        "https://example.test/browser.m3u8",
-    }
+
+    assert await discovery.discover_page("https://example.test/page", browser=sentinel) == {stream_url}
+    assert calls == ["http"]
+
+
+@pytest.mark.asyncio
+async def test_browser_runs_after_http_miss(monkeypatch):
+    """Playwright remains available as the fallback when direct HTML has no HLS."""
+    sentinel = object()
+    browser_stream = "https://example.test/browser.m3u8"
+    calls: list[str] = []
+
+    async def fake_http(_url: str) -> set[str]:
+        """Simulate a source page without an HLS URL in its HTML."""
+        calls.append("http")
+        return set()
+
+    async def fake_browser(_url: str, *, browser) -> set[str]:
+        """Return the HLS URL found from browser network traffic."""
+        assert browser is sentinel
+        calls.append("browser")
+        return {browser_stream}
+
+    monkeypatch.setattr(discovery, "discover_http", fake_http)
+    monkeypatch.setattr(discovery, "discover_browser", fake_browser)
+
+    assert await discovery.discover_page("https://example.test/page", browser=sentinel) == {browser_stream}
+    assert calls == ["http", "browser"]
 
 
 @pytest.mark.asyncio
