@@ -189,7 +189,8 @@ async def test_browser_waits_for_delayed_hls_when_player_controls_are_not_ready(
         settle_ms=1,
         hard_timeout_ms=150,
     )
+    returned_streams = set(streams)
 
     if delayed_task is not None:
         await delayed_task
-    assert streams == {hls_url}
+    assert returned_streams == {hls_url}
