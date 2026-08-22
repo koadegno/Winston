@@ -8,6 +8,7 @@ import re
 from urllib.parse import urljoin
 
 from .discovery import fetch_text
+from .log import log
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,16 +87,36 @@ def choose_best_stream(variants: list[HlsVariant]) -> HlsVariant:
 
 async def resolve_candidate(url: str) -> tuple[HlsVariant, set[str]]:
     """Resolve one HLS candidate into its best concrete stream and known variants."""
-    text, final_url = await fetch_text(url)
+    log(f"[hls] resolve {url}")
+    try:
+        text, final_url = await fetch_text(url)
+    except Exception as exc:
+        log(f"[hls] ERROR {url}: {type(exc).__name__}: {exc}")
+        raise
+
     variants = parse_master_playlist(text, final_url)
     if not variants:
+        log(f"[hls] media playlist {final_url}")
         return HlsVariant(url=final_url), set()
-    return choose_best_stream(variants), {variant.url for variant in variants}
+
+    best = choose_best_stream(variants)
+    quality = (
+        f"{best.resolution[0]}x{best.resolution[1]}"
+        if best.resolution
+        else "resolution unknown"
+    )
+    log(
+        f"[hls] master {final_url}: {len(variants)} variant(s); "
+        f"selected {quality}, bandwidth={best.bandwidth}, url={best.url}"
+    )
+    return best, {variant.url for variant in variants}
 
 
 async def resolve_cameras(candidate_urls: set[str]) -> list[HlsVariant]:
     """Resolve all HLS candidates concurrently and deduplicate logical cameras."""
     ordered_urls = sorted(candidate_urls)
+    log(f"[hls] resolving {len(ordered_urls)} candidate playlist(s) in parallel")
+
     # Candidate playlists are independent network requests, so resolve them together.
     results = await asyncio.gather(
         *(resolve_candidate(url) for url in ordered_urls),
@@ -106,6 +127,7 @@ async def resolve_cameras(candidate_urls: set[str]) -> list[HlsVariant]:
     referenced_variants: set[str] = set()
     for url, result in zip(ordered_urls, results, strict=True):
         if isinstance(result, BaseException):
+            log(f"[hls] candidate failed {url}: {type(result).__name__}: {result}")
             continue
         best, variants = result
         resolved[url] = (best, variants)
@@ -121,4 +143,6 @@ async def resolve_cameras(candidate_urls: set[str]) -> list[HlsVariant]:
             continue
         seen_stream_urls.add(best.url)
         cameras.append(best)
+
+    log(f"[hls] resolved {len(cameras)} logical camera(s)")
     return cameras
