@@ -22,15 +22,15 @@ uv run python -m playwright install chromium
 
 Independent I/O is concurrent:
 
-- all source pages from `Place_Overview.xlsb` are discovered concurrently;
+- all source discovery tasks from `Place_Overview.xlsb` are scheduled concurrently;
 - direct HTTP inspection and Playwright observation for one page run concurrently;
-- iframe/player URLs at the same depth are opened concurrently as isolated Playwright contexts;
+- iframe/player targets at the same depth are scheduled concurrently;
 - all HLS candidates for a page are resolved concurrently;
 - all sources record concurrently;
 - all cameras belonging to a source record concurrently;
 - FFmpeg processes are awaited asynchronously, so one camera never blocks another.
 
-One Chromium process is shared across a multi-source command. Each source/player target gets an isolated browser context.
+Playwright is deliberately bounded because browser pages are the expensive resource. A multi-source command launches one Chromium process, creates one shared browser context, and allows at most 4 active pages at once. Each target page is closed as soon as its discovery step finishes, while the remaining async tasks continue waiting for a browser-page slot without blocking HTTP or FFmpeg work.
 
 ## Discover one page
 
