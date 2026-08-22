@@ -1,19 +1,23 @@
 """Qdrant implementation of Winston's class-agnostic visual index."""
 
 from collections.abc import Sequence
+from itertools import batched
 from typing import Protocol
 
 from qdrant_client import AsyncQdrantClient, models
 
 from winston.config import QdrantSettings
 from winston.embeddings.models import EmbeddingIdentity
-from winston.index.identity import timestamp_to_microseconds, visual_point_id
+from winston.index.identity import visual_point_id
 from winston.index.models import (
     IncompatibleVisualIndexError,
     IndexedVisual,
     VisualIndexConfigurationError,
     VisualIndexError,
 )
+
+type CollectionMetadataValue = str | int
+type CollectionMetadata = dict[str, CollectionMetadataValue]
 
 WINSTON_SCHEMA_VERSION = 1
 VISUAL_DISTANCE = models.Distance.COSINE
@@ -30,7 +34,7 @@ class _CollectionConfig(Protocol):
     """Structural subset of Qdrant collection config required by Winston."""
 
     params: _CollectionParams
-    metadata: dict[str, object] | None
+    metadata: CollectionMetadata | None
 
 
 class _CollectionInfo(Protocol):
@@ -51,7 +55,7 @@ class _QdrantClient(Protocol):
         collection_name: str,
         *,
         vectors_config: dict[str, models.VectorParams],
-        metadata: dict[str, object],
+        metadata: CollectionMetadata,
     ) -> bool:
         """Create a collection with named vectors and Winston metadata."""
         ...
@@ -66,7 +70,7 @@ class _QdrantClient(Protocol):
         *,
         points: list[models.PointStruct],
         wait: bool,
-    ) -> object:
+    ) -> models.UpdateResult:
         """Upsert one bounded batch of points."""
         ...
 
@@ -139,8 +143,7 @@ class QdrantVisualIndex:
                 )
 
         batch_size = int(self._settings.upsert_batch_size)
-        for start in range(0, len(visuals), batch_size):
-            chunk = visuals[start : start + batch_size]
+        for chunk in batched(visuals, batch_size):
             points = [self._point_from_visual(visual) for visual in chunk]
             try:
                 await self._client.upsert(
@@ -212,7 +215,7 @@ class QdrantVisualIndex:
                     "Explicit reindexing is required."
                 )
 
-    def _collection_metadata(self, identity: EmbeddingIdentity) -> dict[str, object]:
+    def _collection_metadata(self, identity: EmbeddingIdentity) -> CollectionMetadata:
         """Build the required Winston-owned collection compatibility metadata."""
         return {
             "winston_schema_version": WINSTON_SCHEMA_VERSION,
@@ -225,29 +228,10 @@ class QdrantVisualIndex:
 
     def _point_from_visual(self, visual: IndexedVisual) -> models.PointStruct:
         """Map one validated Winston visual to a Qdrant point without raw media bytes."""
-        payload: dict[str, object] = {
-            "asset_id": visual.asset_id,
-            "source_path": visual.source_path,
-            "media_type": visual.media_type.value,
-            "sample_kind": visual.sample_kind.value,
-            "timestamp_seconds": visual.timestamp_seconds,
-            "timestamp_us": timestamp_to_microseconds(visual.timestamp_seconds),
-            "region_kind": visual.region_kind.value,
-            "region": {
-                "x": visual.region.x,
-                "y": visual.region.y,
-                "width": visual.region.width,
-                "height": visual.region.height,
-                "scale": visual.region.scale,
-            },
-            "model_id": visual.embedding_identity.model_id,
-            "dimension": visual.embedding_identity.dimension,
-            "preprocessing_version": visual.embedding_identity.preprocessing_version,
-        }
         return models.PointStruct(
             id=str(visual_point_id(visual)),
             vector={self._settings.vector_name: visual.vector.tolist()},
-            payload=payload,
+            payload=visual.model_dump(mode="json"),
         )
 
 
