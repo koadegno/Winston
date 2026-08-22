@@ -113,3 +113,105 @@ async def test_http_and_browser_layers_run_concurrently(monkeypatch):
         "https://example.test/http.m3u8",
         "https://example.test/browser.m3u8",
     }
+
+
+@pytest.mark.asyncio
+async def test_browser_target_visits_share_context_and_limit_active_pages():
+    """Browser target visits reuse one context and cap concurrent pages."""
+    max_pages = 4
+    state = {
+        "active_pages": 0,
+        "max_active_pages": 0,
+        "new_context_calls": 0,
+    }
+
+    class FakeLocator:
+        """Return no iframes for the synthetic browser page."""
+
+        async def evaluate_all(self, _expression: str) -> list[str]:
+            """Return an empty iframe URL list."""
+            return []
+
+    class FakePage:
+        """Track synthetic page lifetime for concurrency assertions."""
+
+        def __init__(self) -> None:
+            """Initialize one synthetic page as open and inactive."""
+            self._active = False
+            self._closed = False
+
+        def on(self, _event: str, _callback) -> None:
+            """Accept request listeners without emitting synthetic requests."""
+
+        async def goto(self, _url: str, **_kwargs) -> None:
+            """Mark this synthetic page as actively navigating."""
+            self._active = True
+            state["active_pages"] += 1
+            state["max_active_pages"] = max(
+                state["max_active_pages"],
+                state["active_pages"],
+            )
+
+        async def wait_for_timeout(self, _timeout_ms: int) -> None:
+            """Keep pages overlapping long enough to measure peak concurrency."""
+            await asyncio.sleep(0.02)
+
+        def locator(self, _selector: str) -> FakeLocator:
+            """Return the synthetic iframe locator."""
+            return FakeLocator()
+
+        async def close(self) -> None:
+            """Close the page once and update the active-page count."""
+            if self._closed:
+                return
+            self._closed = True
+            if self._active:
+                state["active_pages"] -= 1
+                self._active = False
+
+    class FakeContext:
+        """Create synthetic pages and close any pages it owns."""
+
+        def __init__(self) -> None:
+            """Initialize an empty synthetic page collection."""
+            self.pages: list[FakePage] = []
+
+        async def new_page(self) -> FakePage:
+            """Create and remember one synthetic page."""
+            page = FakePage()
+            self.pages.append(page)
+            return page
+
+        async def close(self) -> None:
+            """Close every page created by this synthetic context."""
+            await asyncio.gather(*(page.close() for page in self.pages))
+
+    class FakeBrowserSession:
+        """Expose both old and desired browser APIs to detect context fan-out."""
+
+        def __init__(self) -> None:
+            """Create one shared context and the desired global page semaphore."""
+            self.context = FakeContext()
+            self.page_semaphore = asyncio.Semaphore(max_pages)
+
+        async def new_context(self) -> FakeContext:
+            """Count legacy per-target context creation and return a fresh context."""
+            state["new_context_calls"] += 1
+            return FakeContext()
+
+    browser = FakeBrowserSession()
+    await asyncio.gather(
+        *(
+            discovery._visit_browser_target(
+                browser,
+                f"https://example.test/{index}",
+                timeout_ms=1_000,
+                settle_ms=1,
+            )
+            for index in range(8)
+        )
+    )
+
+    assert state["new_context_calls"] == 0
+    assert state["max_active_pages"] <= max_pages
+    assert state["active_pages"] == 0
