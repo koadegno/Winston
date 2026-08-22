@@ -195,6 +195,6 @@ async def test_browser_waits_for_delayed_hls_when_player_controls_are_not_ready(
     # after the function has already closed the page, which is precisely the regression under test.
     returned_streams = set(streams)
 
-    if delayed_task is not None:
-        await delayed_task
+    assert delayed_task is not None
+    await delayed_task
     assert returned_streams == {hls_url}
