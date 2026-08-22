@@ -6,6 +6,14 @@ on:
       - feat/public-stream-recorder
     paths:
       - '.github/workflows/stream-recorder-full-discovery.yml'
+  pull_request:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/stream-recorder-full-discovery.yml'
+      - 'scripts/stream_recorder/**'
+      - 'pyproject.toml'
+      - 'uv.lock'
   workflow_dispatch:
 
 jobs:
