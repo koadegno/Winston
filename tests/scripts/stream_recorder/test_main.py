@@ -1,4 +1,5 @@
 import asyncio
+from contextlib import asynccontextmanager
 import json
 from pathlib import Path
 
@@ -86,7 +87,7 @@ async def test_xlsb_candidates_only_passes_resolve_false(monkeypatch, tmp_path: 
     """The XLSB CLI path honors candidates-only mode just like single-URL discovery."""
     observed: dict[str, bool] = {}
 
-    async def fake_discover_xlsb(_path, *, use_browser_fallback: bool, resolve: bool):
+    async def fake_discover_xlsb(_path, *, use_browser_fallback: bool, resolve: bool, **_kwargs):
         """Capture the resolve flag passed by the CLI."""
         observed["resolve"] = resolve
         observed["browser"] = use_browser_fallback
@@ -124,3 +125,40 @@ async def test_record_sources_start_concurrently(monkeypatch, tmp_path: Path):
     monkeypatch.setattr(main_module, "record_source_forever", fake_record)
     await main_module._record_sources(sources, tmp_path, use_browser=False)
     assert started == {"1", "2"}
+
+
+@pytest.mark.asyncio
+async def test_discover_browser_concurrency_option_controls_shared_session(monkeypatch, capsys):
+    """The CLI forwards the requested browser page limit to the shared session."""
+    observed: dict[str, object] = {}
+    sentinel = object()
+
+    @asynccontextmanager
+    async def fake_browser_session(*, enabled: bool, max_pages: int):
+        """Capture browser-session configuration and yield one sentinel session."""
+        observed["enabled"] = enabled
+        observed["max_pages"] = max_pages
+        yield sentinel
+
+    async def fake_discover_url(_url: str, **kwargs):
+        """Capture the shared session passed to single-URL discovery."""
+        observed["browser"] = kwargs.get("browser")
+        return {"url": _url, "candidates": [], "cameras": []}
+
+    monkeypatch.setattr(main_module, "browser_session", fake_browser_session)
+    monkeypatch.setattr(main_module, "discover_url", fake_discover_url)
+
+    assert await main([
+        "discover",
+        "--url",
+        "https://example.test/page",
+        "--browser-concurrency",
+        "2",
+        "--candidates-only",
+    ]) == 0
+    json.loads(capsys.readouterr().out)
+    assert observed == {
+        "enabled": True,
+        "max_pages": 2,
+        "browser": sentinel,
+    }
