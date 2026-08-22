@@ -34,6 +34,36 @@ The recorder schedules independent I/O concurrently without allowing browser ren
 
 The browser limit is configurable with `--browser-concurrency N`. Increasing it can speed up discovery but also increases RAM use because each active Chromium renderer can consume hundreds of MB.
 
+Playwright listens to the complete page network, including requests emitted by normally loaded frames. If a page already exposes one or more HLS streams, its iframe URLs are **not reopened as separate browser targets**. Separate iframe crawling is only used when the parent page exposed no HLS at all. This avoids duplicating expensive browser work while preserving the iframe fallback needed by third-party players.
+
+## Progress logs
+
+Machine-readable discovery JSON is written to stdout. Detailed progress is written immediately to stderr, so a long batch never looks frozen.
+
+The logs show:
+
+- every source task starting and completing;
+- direct HTTP request start, completion time, candidate count, and errors;
+- Chromium startup and shutdown;
+- every browser target entering the queue;
+- every browser tab opening, loading, finding HLS requests, and closing;
+- iframe fallback depth and whether iframe targets are skipped;
+- HLS master/variant resolution and selected quality;
+- source/camera metadata creation;
+- each FFmpeg process starting, its PID, output file, duration, and exit code;
+- retry and HLS rediscovery after FFmpeg failures.
+
+Typical browser progress looks like:
+
+```text
+[00:50:45] [browser] queued https://example.com/webcam
+[00:50:45] [browser] open https://example.com/webcam
+[00:50:48] [browser] HLS https://cdn.example.com/live/stream.m3u8
+[00:50:48] [browser] done https://example.com/webcam: 1 HLS, 2 iframe(s) in 3.2s
+[00:50:48] [browser] closed https://example.com/webcam
+[00:50:48] [browser] skip 2 iframe target(s) under https://example.com/webcam: HLS already observed on parent page
+```
+
 ## Discover one page
 
 ```bash
