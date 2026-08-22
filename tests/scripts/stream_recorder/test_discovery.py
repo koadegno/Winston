@@ -113,3 +113,72 @@ async def test_http_and_browser_layers_run_concurrently(monkeypatch):
         "https://example.test/http.m3u8",
         "https://example.test/browser.m3u8",
     }
+
+
+@pytest.mark.asyncio
+async def test_browser_targets_share_one_context_and_respect_page_limit():
+    """Browser targets reuse one context and never exceed the configured active-tab limit."""
+    active_pages = 0
+    max_active_pages = 0
+    total_pages = 0
+
+    class FakeLocator:
+        """Return no child iframes for the synthetic browser page."""
+
+        async def evaluate_all(self, _script: str) -> list[str]:
+            """Return an empty iframe list."""
+            return []
+
+    class FakePage:
+        """Model one browser tab while tracking active-tab accounting."""
+
+        def on(self, _event: str, _callback) -> None:
+            """Accept request listeners without emitting synthetic requests."""
+            return None
+
+        async def goto(self, _url: str, **_kwargs) -> None:
+            """Keep the tab alive briefly so concurrent visits overlap."""
+            await asyncio.sleep(0.02)
+
+        async def wait_for_timeout(self, _milliseconds: int) -> None:
+            """Yield control without adding test latency."""
+            await asyncio.sleep(0)
+
+        def locator(self, _selector: str) -> FakeLocator:
+            """Return the fake iframe locator."""
+            return FakeLocator()
+
+        async def close(self) -> None:
+            """Mark this synthetic tab as closed."""
+            nonlocal active_pages
+            active_pages -= 1
+
+    class FakeContext:
+        """Create tabs from one shared browser context and track concurrency."""
+
+        async def new_page(self) -> FakePage:
+            """Create one synthetic tab and update active-tab counters."""
+            nonlocal active_pages, max_active_pages, total_pages
+            active_pages += 1
+            total_pages += 1
+            max_active_pages = max(max_active_pages, active_pages)
+            return FakePage()
+
+    session_type = getattr(discovery, "BrowserSession", None)
+    assert session_type is not None, "bounded shared BrowserSession is not implemented"
+    session = session_type(context=FakeContext(), page_semaphore=asyncio.Semaphore(2))
+
+    await asyncio.gather(
+        *(
+            discovery._visit_browser_target(
+                session,
+                f"https://example.test/{index}",
+                timeout_ms=1_000,
+                settle_ms=0,
+            )
+            for index in range(6)
+        )
+    )
+
+    assert total_pages == 6
+    assert max_active_pages == 2
