@@ -25,7 +25,7 @@ DEFAULT_HTTP_CONNECTIONS = 32
 DEFAULT_HTTP_TIMEOUT_SECONDS = 10.0
 DEFAULT_HTTP_TOTAL_TIMEOUT_SECONDS = 12.0
 _BROWSER_STREAM_GRACE_MS = 750
-_MEDIA_ACTIVATION_GRACE_MS = 1_500
+_MEDIA_ACTIVATION_GRACE_MS = 4_000
 _MAX_HLS_URL_TOKEN_LENGTH = 4096
 _HLS_MARKER = ".m3u8"
 _LEFT_URL_BOUNDARIES = frozenset(" \t\r\n'\"<>`()[]{},;=")
@@ -427,7 +427,7 @@ async def _activate_video_elements(page: Any, prefix: str, deadline: float) -> b
 
 
 async def _click_play_controls(page: Any, prefix: str, deadline: float) -> bool:
-    """Click one visible play control per frame when programmatic playback emitted no HLS."""
+    """Click one visible play control per frame before falling back to programmatic playback."""
     clicked = False
     for frame_index, frame in enumerate(page.frames):
         for selector in _PLAY_CONTROL_SELECTORS:
@@ -470,7 +470,7 @@ async def _wait_for_hls_after_activation(
     *,
     deadline: float,
 ) -> None:
-    """Wait briefly for a media activation to produce an HLS request."""
+    """Wait for a user-gesture/programmatic activation to produce an HLS request."""
     wait_seconds = min(_MEDIA_ACTIVATION_GRACE_MS / 1000, _remaining_seconds(deadline))
     try:
         await asyncio.wait_for(stream_seen.wait(), timeout=wait_seconds)
@@ -575,13 +575,15 @@ async def _visit_browser_target(
                         )
 
             if not streams:
-                log(f"{prefix} no HLS after initial load; trying media activation")
-                attempted = await _activate_video_elements(page, prefix, deadline)
-                if attempted and not streams:
+                log(f"{prefix} no HLS after initial load; trying user-gesture media activation")
+                # Real third-party players can explicitly require a user gesture. Try visible play
+                # controls first; only use HTMLMediaElement.play() if the click path produced no HLS.
+                clicked = await _click_play_controls(page, prefix, deadline)
+                if clicked and not streams:
                     await _wait_for_hls_after_activation(stream_seen, deadline=deadline)
                 if not streams:
-                    clicked = await _click_play_controls(page, prefix, deadline)
-                    if clicked and not streams:
+                    attempted = await _activate_video_elements(page, prefix, deadline)
+                    if attempted and not streams:
                         await _wait_for_hls_after_activation(stream_seen, deadline=deadline)
 
             # Ensure the settle/activation window itself did not consume the deadline.
