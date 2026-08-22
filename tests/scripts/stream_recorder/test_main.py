@@ -35,6 +35,17 @@ def test_browser_concurrency_defaults_to_four_and_is_configurable():
     assert record_args.browser_concurrency == 1
 
 
+def test_sources_option_is_canonical_for_csv_and_legacy_xlsb_remains_supported():
+    """The CLI names the source list generically while preserving the legacy XLSB alias."""
+    parser = main_module.build_parser()
+
+    csv_args = parser.parse_args(["record", "--sources", "Place_Overview.csv"])
+    legacy_args = parser.parse_args(["record", "--xlsb", "Place_Overview.xlsb"])
+
+    assert csv_args.sources == Path("Place_Overview.csv")
+    assert legacy_args.sources == Path("Place_Overview.xlsb")
+
+
 @pytest.mark.asyncio
 async def test_discover_url_prints_json(monkeypatch, capsys):
     """Single-URL discovery keeps machine-readable JSON on stdout."""
