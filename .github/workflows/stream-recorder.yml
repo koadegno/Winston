@@ -120,54 +120,30 @@ jobs:
           print(f"debica_cameras={len(debica['cameras'])}")
           PY
 
-      - name: Diagnose Boccadasse beyond normal discovery deadline
+      - name: Verify Boccadasse through the normal recorder discovery path
         shell: bash
         run: |
+          set -euo pipefail
+
+          timeout 90s python -m scripts.stream_recorder.main discover \
+            --url 'https://www.skylinewebcams.com/en/webcam/italia/liguria/genova/boccadasse-genova.html' \
+            > /tmp/boccadasse.json
+
+          cat /tmp/boccadasse.json
+
           python - <<'PY'
-          import asyncio
-          from playwright.async_api import async_playwright
+          import json
+          from pathlib import Path
+          from urllib.parse import urlparse
 
-          URL = 'https://www.skylinewebcams.com/en/webcam/italia/liguria/genova/boccadasse-genova.html'
+          payload = json.loads(Path('/tmp/boccadasse.json').read_text())
+          candidates = payload['candidates']
+          assert any(
+              urlparse(url).hostname == 'hd-auth.skylinewebcams.com'
+              for url in candidates
+          ), payload
+          assert payload['cameras'], payload
 
-          async def main() -> None:
-              """Observe the Boccadasse player for twenty seconds after a real click."""
-              async with async_playwright() as playwright:
-                  browser = await playwright.chromium.launch(headless=True)
-                  context = await browser.new_context()
-                  page = await context.new_page()
-                  m3u8 = set()
-
-                  def collect(request) -> None:
-                      """Collect all HLS requests while surfacing Skyline media traffic."""
-                      lowered = request.url.lower()
-                      if '.m3u8' in lowered:
-                          m3u8.add(request.url)
-                      if '.m3u8' in lowered or 'skyline' in lowered or request.resource_type == 'media':
-                          print(f'REQUEST {request.resource_type}: {request.url}')
-
-                  page.on('request', collect)
-                  await page.goto(URL, wait_until='domcontentloaded', timeout=20_000)
-                  await page.wait_for_timeout(4_000)
-                  videos = page.locator('video')
-                  count = await videos.count()
-                  print(f'VIDEO_COUNT={count}')
-                  if count:
-                      print('VIDEO_BEFORE=', await videos.evaluate_all(
-                          "els => els.map(v => ({src:v.src,currentSrc:v.currentSrc,paused:v.paused,readyState:v.readyState,error:v.error && v.error.code}))"
-                      ))
-                      await videos.first.click(force=True, timeout=2_000)
-                      print('CLICKED_VIDEO')
-                  for seconds, wait_ms in ((2, 2_000), (5, 3_000), (10, 5_000), (20, 10_000)):
-                      await page.wait_for_timeout(wait_ms)
-                      print(f'AFTER_{seconds}S_M3U8={sorted(m3u8)}')
-                      if count:
-                          print(f'VIDEO_AFTER_{seconds}S=', await videos.evaluate_all(
-                              "els => els.map(v => ({src:v.src,currentSrc:v.currentSrc,paused:v.paused,readyState:v.readyState,error:v.error && v.error.code}))"
-                          ))
-                  print(f'FINAL_M3U8_COUNT={len(m3u8)}')
-                  await page.close()
-                  await context.close()
-                  await browser.close()
-
-          asyncio.run(main())
+          print(f"boccadasse_candidates={len(candidates)}")
+          print(f"boccadasse_cameras={len(payload['cameras'])}")
           PY
