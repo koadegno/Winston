@@ -80,3 +80,5 @@ jobs:
           git add scripts/stream_recorder/discovery.py
           git commit -m 'fix: wait for delayed player HLS initialization'
           git push origin HEAD:feat/public-stream-recorder
+
+# Temporary implementation workflow; delete after the production commit is pushed.
