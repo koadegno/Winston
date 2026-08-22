@@ -8,12 +8,16 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 import re
 import ssl
+import time
 from typing import Any
 from urllib.parse import urljoin
 from urllib.request import Request, urlopen
 
+from .log import log
+
 
 DEFAULT_BROWSER_CONCURRENCY = 2
+_BROWSER_STREAM_GRACE_MS = 750
 
 _M3U8_RE = re.compile(
     r"(?P<url>(?:https?:)?(?:\\?/[^\s'\"<>]*)?[^\s'\"<>]*?\.m3u8(?:\?[^\s'\"<>]*)?)",
@@ -70,8 +74,19 @@ async def fetch_text(url: str, timeout: float = 20.0) -> tuple[str, str]:
 
 async def discover_http(url: str) -> set[str]:
     """Discover HLS URLs visible directly in the source page response."""
-    body, final_url = await fetch_text(url)
-    return extract_m3u8_urls(body, final_url)
+    log(f"[http] GET {url}")
+    started = time.monotonic()
+    try:
+        body, final_url = await fetch_text(url)
+    except Exception as exc:
+        elapsed = time.monotonic() - started
+        log(f"[http] ERROR {url} after {elapsed:.1f}s: {type(exc).__name__}: {exc}")
+        raise
+
+    streams = extract_m3u8_urls(body, final_url)
+    elapsed = time.monotonic() - started
+    log(f"[http] done {url}: {len(streams)} HLS candidate(s) in {elapsed:.1f}s")
+    return streams
 
 
 async def crawl_browser_targets(
@@ -90,15 +105,26 @@ async def crawl_browser_targets(
         if not targets:
             break
         seen.update(targets)
+        log(f"[browser] crawl depth {depth}: {len(targets)} target(s)")
 
         # Siblings are scheduled together; BrowserSession applies the global tab limit.
         results = await asyncio.gather(*(visit(target) for target in targets), return_exceptions=True)
         next_level: set[str] = set()
-        for result in results:
+        for target, result in zip(targets, results, strict=True):
             if isinstance(result, BaseException):
+                log(f"[browser] ERROR {target}: {type(result).__name__}: {result}")
                 continue
+
             target_streams, iframe_urls = result
             streams.update(target_streams)
+            if target_streams:
+                if iframe_urls:
+                    log(
+                        f"[browser] skip {len(iframe_urls)} iframe target(s) under {target}: "
+                        "HLS already observed on parent page"
+                    )
+                continue
+
             if depth < max_iframe_depth:
                 next_level.update(url for url in iframe_urls if url not in seen)
         current_level = next_level
@@ -127,23 +153,52 @@ async def _visit_browser_target(
 ) -> tuple[set[str], set[str]]:
     """Observe one target in a shared context while respecting the global tab limit."""
     streams: set[str] = set()
+    stream_seen = asyncio.Event()
+    log(f"[browser] queued {url}")
 
     # A renderer can use hundreds of MB. Keep only a small bounded number alive at once.
     async with session.page_semaphore:
         page = await session.context.new_page()
+        started = time.monotonic()
+        log(f"[browser] open {url}")
         try:
 
             def collect(request: Any) -> None:
                 """Capture HLS requests emitted while the target page is running."""
-                if ".m3u8" in request.url.lower():
-                    streams.add(request.url)
+                if ".m3u8" not in request.url.lower():
+                    return
+                if request.url not in streams:
+                    log(f"[browser] HLS {request.url}")
+                streams.add(request.url)
+                stream_seen.set()
 
             page.on("request", collect)
             await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
-            await page.wait_for_timeout(settle_ms)
-            return streams, await _iframe_urls(page)
+            log(f"[browser] loaded {url}")
+
+            if settle_ms > 0:
+                if streams:
+                    # Once HLS is visible, keep a short grace window for sibling cameras/variants.
+                    await page.wait_for_timeout(min(settle_ms, _BROWSER_STREAM_GRACE_MS))
+                else:
+                    # Pages without an immediate stream still get the full settle window.
+                    try:
+                        await asyncio.wait_for(stream_seen.wait(), timeout=settle_ms / 1000)
+                    except TimeoutError:
+                        pass
+                    else:
+                        await page.wait_for_timeout(min(settle_ms, _BROWSER_STREAM_GRACE_MS))
+
+            iframe_urls = await _iframe_urls(page)
+            elapsed = time.monotonic() - started
+            log(
+                f"[browser] done {url}: {len(streams)} HLS, "
+                f"{len(iframe_urls)} iframe(s) in {elapsed:.1f}s"
+            )
+            return streams, iframe_urls
         finally:
             await page.close()
+            log(f"[browser] closed {url}")
 
 
 @asynccontextmanager
@@ -164,17 +219,21 @@ async def browser_session(
     except ImportError as exc:
         raise RuntimeError("playwright is required for browser-based stream discovery") from exc
 
+    log(f"[browser] launching one Chromium process; max {max_pages} active tab(s)")
     async with async_playwright() as playwright:
         browser = await playwright.chromium.launch(headless=True)
         context = await browser.new_context()
+        log("[browser] Chromium ready; one shared browser context created")
         try:
             yield BrowserSession(
                 context=context,
                 page_semaphore=asyncio.Semaphore(max_pages),
             )
         finally:
+            log("[browser] closing shared browser context and Chromium")
             await context.close()
             await browser.close()
+            log("[browser] Chromium closed")
 
 
 async def discover_browser(
@@ -189,6 +248,8 @@ async def discover_browser(
     if browser is None:
         raise RuntimeError("browser discovery requires an active browser session")
 
+    log(f"[browser] discovery start {url}")
+
     async def visit(target_url: str) -> tuple[set[str], set[str]]:
         """Visit one target while converting target-specific failures to an empty result."""
         try:
@@ -198,11 +259,14 @@ async def discover_browser(
                 timeout_ms=timeout_ms,
                 settle_ms=settle_ms,
             )
-        except Exception:
+        except Exception as exc:
             # A broken third-party player must not prevent other cameras from being discovered.
+            log(f"[browser] target failed {target_url}: {type(exc).__name__}: {exc}")
             return set(), set()
 
-    return await crawl_browser_targets(url, visit, max_iframe_depth=max_iframe_depth)
+    streams = await crawl_browser_targets(url, visit, max_iframe_depth=max_iframe_depth)
+    log(f"[browser] discovery done {url}: {len(streams)} HLS candidate(s)")
+    return streams
 
 
 async def discover_page(
@@ -222,13 +286,14 @@ async def discover_page(
                 browser_concurrency=browser_concurrency,
             )
 
+    log(f"[discover] page start {url}")
     coroutines: list[Awaitable[set[str]]] = [discover_http(url)]
     if use_browser_fallback:
         if browser is None:
             raise RuntimeError("browser discovery requires an active browser session")
         coroutines.append(discover_browser(url, browser=browser))
 
-    # HTTP source inspection and browser observation are independent I/O paths.
+    # HTTP and browser observation remain independent so dynamic cameras are not missed.
     results = await asyncio.gather(*coroutines, return_exceptions=True)
     streams: set[str] = set()
     errors: list[BaseException] = []
@@ -240,4 +305,6 @@ async def discover_page(
 
     if not streams and len(errors) == len(results):
         raise errors[0]
+
+    log(f"[discover] page done {url}: {len(streams)} unique HLS candidate(s)")
     return streams
