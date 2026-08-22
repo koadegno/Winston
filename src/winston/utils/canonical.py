@@ -4,8 +4,7 @@ from collections.abc import Mapping
 from decimal import Decimal, ROUND_HALF_UP
 import json
 
-
-type JsonValue = str | int | float | bool | None | list[JsonValue] | dict[str, JsonValue]
+from pydantic import JsonValue
 
 MICROSECONDS_PER_SECOND = Decimal(1_000_000)
 
