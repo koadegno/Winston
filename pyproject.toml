@@ -17,6 +17,7 @@ dependencies = [
     "einops>=0.8.0",
     "httpx>=0.28.0",
     "requests>=2.32.0",
+    "qdrant-client>=1.18,<1.19",
 ]
 
 [project.optional-dependencies]
