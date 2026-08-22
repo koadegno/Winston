@@ -80,7 +80,7 @@ async def test_candidates_only_skips_hls_resolution(monkeypatch, capsys):
 
 @pytest.mark.asyncio
 async def test_xlsb_sources_discover_concurrently_and_report_progress(monkeypatch, tmp_path: Path, capsys):
-    """Every XLSB source starts concurrently and emits progress on stderr."""
+    """Every XLSB source task starts concurrently and emits bounded-browser progress."""
     sources = [
         Source("1", "A", "City", "Country", "https://example.test/a"),
         Source("2", "B", "City", "Country", "https://example.test/b"),
@@ -105,7 +105,7 @@ async def test_xlsb_sources_discover_concurrently_and_report_progress(monkeypatc
     )
     captured = capsys.readouterr()
     assert [result["source"]["id"] for result in results] == ["1", "2"]
-    assert "starting 2 sources in parallel" in captured.err
+    assert "scheduling 2 sources; max 2 active browser tab(s)" in captured.err
 
 
 @pytest.mark.asyncio
