@@ -6,6 +6,7 @@ on:
       - main
     paths:
       - '.github/workflows/stream-recorder-debica-tls-debug.yml'
+      - 'tests/scripts/stream_recorder/test_czersk_activation.py'
   workflow_dispatch:
 
 permissions:
