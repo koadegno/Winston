@@ -760,8 +760,9 @@ async def discover_page(
     browser_concurrency: int = DEFAULT_BROWSER_CONCURRENCY,
     client: Any | None = None,
     label: str | None = None,
+    browser_observed_urls: set[str] | None = None,
 ) -> set[str]:
-    """Run staged HTTP then one-page browser discovery for a single source."""
+    """Run staged discovery and optionally report HLS URLs actually requested by the browser."""
     if client is None:
         async with http_session() as local_client:
             return await discover_page(
@@ -771,6 +772,7 @@ async def discover_page(
                 browser_concurrency=browser_concurrency,
                 client=local_client,
                 label=label,
+                browser_observed_urls=browser_observed_urls,
             )
     if use_browser and browser is None:
         async with browser_session(max_pages=browser_concurrency) as local_browser:
@@ -783,6 +785,7 @@ async def discover_page(
                 browser_concurrency=browser_concurrency,
                 client=client,
                 label=label,
+                browser_observed_urls=browser_observed_urls,
             )
 
     prefix = f"[discover][{label}]" if label else "[discover]"
@@ -799,7 +802,12 @@ async def discover_page(
     if use_browser:
         if browser is None:
             raise RuntimeError("browser discovery requires an active browser session")
-        streams.update(await discover_browser(url, browser=browser, label=label))
+        browser_streams = await discover_browser(url, browser=browser, label=label)
+        streams.update(browser_streams)
+        if browser_observed_urls is not None:
+            # Keep provenance separate from static HTML extraction. A request actually emitted by
+            # the rendered player is strong enough evidence to survive a transient HLS probe error.
+            browser_observed_urls.update(browser_streams)
 
     if not streams and http_error is not None:
         raise http_error
