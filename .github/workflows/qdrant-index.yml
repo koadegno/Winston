@@ -52,5 +52,5 @@ jobs:
             'pytest-asyncio>=1.4.0' \
             'qdrant-client>=1.18,<1.19'
           python -m pip install -e . --no-deps
-      - name: Run Phase 1D configuration tests
-        run: python -m pytest -q tests/src/winston/test_config.py
+      - name: Run Phase 1D unit tests
+        run: python -m pytest -q tests/src/winston/test_config.py tests/src/winston/ingest/test_identity.py
