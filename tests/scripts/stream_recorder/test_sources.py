@@ -39,12 +39,12 @@ def test_load_sources_reads_csv_and_skips_disabled_and_youtube(tmp_path):
     assert sources[0].url == "https://example.test/cam"
 
 
-def test_repository_csv_contains_new_pribram_and_skyline_sources():
+def test_repository_csv_contains_new_pribram_skyline_and_brussels_sources():
     """The maintained repository source list contains all newly validated public camera pages."""
     sources = load_sources(Path("Place_Overview.csv"))
     by_id = {source.id: source for source in sources}
 
-    assert len(sources) == 34
+    assert len(sources) == 36
     assert "61" not in by_id
     assert {
         by_id[source_id].url
@@ -60,6 +60,8 @@ def test_repository_csv_contains_new_pribram_and_skyline_sources():
     assert by_id["131"].url.endswith("/santander/playa-del-sardinero.html")
     assert by_id["132"].url.endswith("/birmingham/sutton-coldfield.html")
     assert by_id["133"].url.endswith("/genova/boccadasse-genova.html")
+    assert by_id["134"].url == "https://www.bruxelles.be/webcam-grand-place"
+    assert by_id["135"].url == "https://www.bruxelles.be/webcam-place-de-brouckere"
 
 
 def test_repository_csv_preserves_urls_that_contain_commas():
