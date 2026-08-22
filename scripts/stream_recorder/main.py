@@ -6,8 +6,7 @@ import argparse
 import asyncio
 import json
 from pathlib import Path
-import sys
-from typing import Any, Sequence
+from typing import Sequence
 
 from .discovery import (
     DEFAULT_BROWSER_CONCURRENCY,
@@ -16,6 +15,7 @@ from .discovery import (
     discover_page,
 )
 from .hls import resolve_cameras
+from .log import log
 from .orchestrator import assign_camera_ids, record_source_forever
 from .sources import Source, load_sources
 
@@ -69,6 +69,7 @@ async def _discover_one_source(
     browser_concurrency: int,
 ) -> tuple[int, dict[str, object]]:
     """Discover one XLSB source and capture failures as structured output."""
+    log(f"[discover] source {source.id} START {source.place}: {source.url}")
     try:
         result = await discover_url(
             source.url,
@@ -99,13 +100,9 @@ async def _discover_xlsb(
 ) -> list[dict[str, object]]:
     """Schedule every XLSB source concurrently with bounded browser resource use."""
     sources = load_sources(path)
-    print(
-        (
-            f"[discover] scheduling {len(sources)} sources; "
-            f"max {browser_concurrency} active browser tab(s)"
-        ),
-        file=sys.stderr,
-        flush=True,
+    log(
+        f"[discover] scheduling {len(sources)} sources; "
+        f"max {browser_concurrency} active browser tab(s)"
     )
     if not sources:
         return []
@@ -134,11 +131,7 @@ async def _discover_xlsb(
             ordered_results[index] = result
             source = sources[index]
             status = result.get("error") or f"{len(result['candidates'])} candidate(s)"
-            print(
-                f"[discover] {source.id} {source.place}: {status}",
-                file=sys.stderr,
-                flush=True,
-            )
+            log(f"[discover] source {source.id} DONE {source.place}: {status}")
 
     return [result for result in ordered_results if result is not None]
 
@@ -150,14 +143,11 @@ async def _record_one_source(
     browser: BrowserSession | None,
 ) -> None:
     """Run one source recorder without allowing its failure to stop other sources."""
+    log(f"[record] source {source.id} START {source.place}: {source.url}")
     try:
         await record_source_forever(source, output_root, browser=browser)
     except Exception as exc:
-        print(
-            f"[{source.id}] {source.url}: {type(exc).__name__}: {exc}",
-            file=sys.stderr,
-            flush=True,
-        )
+        log(f"[record] source {source.id} ERROR {source.url}: {type(exc).__name__}: {exc}")
 
 
 async def _record_sources(
@@ -171,13 +161,9 @@ async def _record_sources(
     if not sources:
         raise RuntimeError("No non-YouTube sources found")
 
-    print(
-        (
-            f"[record] scheduling {len(sources)} sources; "
-            f"max {browser_concurrency} active browser tab(s)"
-        ),
-        file=sys.stderr,
-        flush=True,
+    log(
+        f"[record] scheduling {len(sources)} sources; "
+        f"max {browser_concurrency} active browser tab(s); output={output_root}"
     )
     async with browser_session(
         enabled=use_browser,
@@ -259,7 +245,7 @@ async def main(argv: Sequence[str] | None = None) -> int:
         use_browser = not args.no_browser
         resolve = not args.candidates_only
         if args.url:
-            print(f"[discover] {args.url}", file=sys.stderr, flush=True)
+            log(f"[discover] single URL {args.url}")
             payload: dict[str, object] | list[dict[str, object]] = await discover_url(
                 args.url,
                 use_browser_fallback=use_browser,
