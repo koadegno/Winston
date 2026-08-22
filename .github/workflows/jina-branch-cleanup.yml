@@ -1,0 +1,40 @@
+name: Jina branch cleanup
+
+on:
+  push:
+    branches:
+      - feat/jina-clip-embeddings
+    paths:
+      - .github/workflows/jina-branch-cleanup.yml
+
+permissions:
+  contents: write
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Delete temporary rebase branches
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          for branch in rebase-jina-temp rebase-jina-temp2 rebase-jina-temp3 rebase-jina-temp4; do
+            gh api --method DELETE "repos/${GITHUB_REPOSITORY}/git/refs/heads/${branch}" || true
+          done
+
+      - name: Wait for PR merge and delete feature branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          for _ in $(seq 1 150); do
+            if [ "$(gh api "repos/${GITHUB_REPOSITORY}/pulls/21" --jq '.merged')" = "true" ]; then
+              gh api --method DELETE "repos/${GITHUB_REPOSITORY}/git/refs/heads/feat/jina-clip-embeddings"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo 'PR #21 was not merged before cleanup timeout' >&2
+          exit 1
