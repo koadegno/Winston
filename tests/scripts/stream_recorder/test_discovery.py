@@ -94,6 +94,8 @@ async def test_browser_target_logs_queue_open_result_and_close(capsys):
     class FakePage:
         """Provide the Playwright methods used by one synthetic source page."""
 
+        frames: list[object] = []
+
         def on(self, _event: str, _callback) -> None:
             """Accept network listeners without emitting a stream."""
             return None
@@ -133,6 +135,88 @@ async def test_browser_target_logs_queue_open_result_and_close(capsys):
 
 
 @pytest.mark.asyncio
+async def test_browser_target_activates_media_when_initial_load_emits_no_hls():
+    """A player that waits for Play is activated without opening another browser page."""
+    hls_url = "https://7005.szczecin.pl/camss/streams/czersk.m3u8"
+    activated = False
+
+    class Request:
+        """Represent the HLS request emitted after synthetic media activation."""
+
+        url = hls_url
+
+    class FakeVideoLocator:
+        """Expose one video element whose activation starts the HLS request."""
+
+        async def count(self) -> int:
+            """Report one video element in the synthetic iframe."""
+            return 1
+
+        async def evaluate_all(self, _script: str) -> list[object]:
+            """Model calling play() on all video elements."""
+            nonlocal activated
+            activated = True
+            page.request_callback(Request())
+            return []
+
+    class FakeFrame:
+        """Expose the video locator used by the media-activation fallback."""
+
+        url = "https://stream360.pl/v/Czersk/index1.php"
+
+        def locator(self, selector: str) -> FakeVideoLocator:
+            """Return the synthetic video collection for the video selector."""
+            assert selector == "video"
+            return FakeVideoLocator()
+
+    class FakePage:
+        """Load without HLS until the embedded video is explicitly activated."""
+
+        request_callback = None
+
+        def __init__(self) -> None:
+            """Attach one embedded player frame."""
+            self.frames = [FakeFrame()]
+
+        def on(self, event: str, callback) -> None:
+            """Store the request listener used by discovery."""
+            assert event == "request"
+            self.request_callback = callback
+
+        async def goto(self, _url: str, **_kwargs) -> None:
+            """Load the page without starting media automatically."""
+            return None
+
+        async def close(self) -> None:
+            """Close the synthetic page."""
+            return None
+
+    page = FakePage()
+
+    class FakeContext:
+        """Return exactly one source page from the shared context."""
+
+        async def new_page(self) -> FakePage:
+            """Return the prebuilt synthetic page."""
+            return page
+
+    session = discovery.BrowserSession(
+        context=FakeContext(),
+        page_semaphore=asyncio.Semaphore(1),
+    )
+
+    streams = await discovery._visit_browser_target(
+        session,
+        "https://czersk.pl/strona/552-kamera-line",
+        settle_ms=1,
+        hard_timeout_ms=1_000,
+    )
+
+    assert activated
+    assert streams == {hls_url}
+
+
+@pytest.mark.asyncio
 async def test_browser_targets_share_one_context_and_respect_page_limit():
     """Source pages reuse one context and never exceed the configured active-tab limit."""
     active_pages = 0
@@ -141,6 +225,8 @@ async def test_browser_targets_share_one_context_and_respect_page_limit():
 
     class FakePage:
         """Model one browser tab while tracking active-tab accounting."""
+
+        frames: list[object] = []
 
         def on(self, _event: str, _callback) -> None:
             """Accept request listeners without emitting synthetic requests."""
