@@ -738,8 +738,16 @@ async def discover_browser(
                 continue
             log(f"{prefix} failed {url}: {type(exc).__name__}: {exc}")
             return set()
-        log(f"{prefix} discovery done: {len(streams)} HLS candidate(s)")
-        return streams
+        if streams:
+            log(f"{prefix} discovery done: {len(streams)} HLS candidate(s)")
+            return streams
+        if attempt == 0:
+            # Some third-party players occasionally initialize without starting their HLS request.
+            # A second visit gets a fresh isolated browser context while keeping the retry bounded.
+            log(f"{prefix} clean miss; retrying once in a fresh source context")
+            continue
+        log(f"{prefix} discovery done: 0 HLS candidate(s) after one clean retry")
+        return set()
 
     return set()
 
