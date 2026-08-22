@@ -1,9 +1,9 @@
 name: Temporary HLS URL filter patch
 
 on:
-  push:
+  pull_request:
     branches:
-      - feat/public-stream-recorder
+      - main
     paths:
       - '.github/workflows/temp-hls-url-filter-patch.yml'
 
