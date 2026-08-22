@@ -159,6 +159,8 @@ async def test_browser_waits_for_delayed_hls_when_player_controls_are_not_ready(
 
             async def emit_later() -> None:
                 """Model a slow third-party player attaching and starting its stream."""
+                # This delay is intentionally longer than the 1 ms initial settle below, so the
+                # test only passes if discovery keeps the page alive for the fallback grace window.
                 await asyncio.sleep(0.025)
                 assert self.request_callback is not None
                 self.request_callback(Request())
