@@ -10,11 +10,13 @@ def test_get_config_reads_unprefixed_environment_variables(
 ) -> None:
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("FFMPEG_BINARY", "custom-ffmpeg")
     monkeypatch.setenv("FFPROBE_BINARY", "custom-ffprobe")
 
     configured = get_config()
 
     assert configured.data_dir == tmp_path
+    assert configured.ffmpeg_binary == "custom-ffmpeg"
     assert configured.ffprobe_binary == "custom-ffprobe"
 
 
