@@ -21,6 +21,18 @@ def test_extracts_absolute_relative_and_escaped_m3u8_urls():
     }
 
 
+def test_default_browser_deadline_leaves_time_for_late_player_activation():
+    """The global page budget must outlive navigation, settle, and interactive player startup."""
+    minimum_budget_ms = (
+        discovery.DEFAULT_BROWSER_NAVIGATION_TIMEOUT_MS
+        + discovery.DEFAULT_BROWSER_SETTLE_MS
+        + discovery._MEDIA_ACTIVATION_GRACE_MS
+        + 10_000
+    )
+
+    assert discovery.DEFAULT_BROWSER_TARGET_HARD_TIMEOUT_MS >= minimum_budget_ms
+
+
 @pytest.mark.asyncio
 async def test_http_discovery_fetches_only_source_page():
     """HTTP discovery reads one page response and never follows embedded third-party URLs."""
