@@ -610,10 +610,17 @@ async def _visit_browser_target(
                 clicked = await _click_play_controls(page, prefix, deadline)
                 if clicked and not streams:
                     await _wait_for_hls_after_activation(stream_seen, deadline=deadline)
+                attempted = False
                 if not streams:
                     attempted = await _activate_video_elements(page, prefix, deadline)
                     if attempted and not streams:
                         await _wait_for_hls_after_activation(stream_seen, deadline=deadline)
+                if not streams and not clicked and not attempted:
+                    # Some players attach their video/control asynchronously after DOMContentLoaded.
+                    # Even when there is nothing to activate yet, keep the source page alive for one
+                    # bounded grace window so late network HLS requests are not missed.
+                    log(f"{prefix} media controls not ready; waiting for delayed HLS initialization")
+                    await _wait_for_hls_after_activation(stream_seen, deadline=deadline)
 
             # Ensure the settle/activation window itself did not consume the deadline.
             _remaining_seconds(deadline)
