@@ -1,0 +1,88 @@
+name: Stream recorder Debica TLS diagnostic
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/stream-recorder-debica-tls-debug.yml'
+  workflow_dispatch:
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install project and Chromium
+        run: |
+          python -m pip install -e '.[script]'
+          python -m playwright install --with-deps chromium
+      - name: Compare strict and TLS-tolerant player contexts
+        shell: bash
+        run: |
+          cat > /tmp/test_debica_tls.py <<'PY'
+          import pytest
+          from playwright.async_api import async_playwright
+
+          URL = 'https://www.kamery24.org/i24/index.php/test/82-debica-rynek'
+
+
+          async def observe(browser, *, ignore_https_errors: bool) -> list[str]:
+              """Open Dębica once and return every HLS request observed from the player."""
+              context = await browser.new_context(ignore_https_errors=ignore_https_errors)
+              page = await context.new_page()
+              streams: set[str] = set()
+
+              def collect(request) -> None:
+                  """Collect HLS requests emitted anywhere in the page/frame tree."""
+                  if '.m3u8' in request.url.lower():
+                      streams.add(request.url)
+                      print(f'ignore_https_errors={ignore_https_errors} HLS {request.url}')
+
+              page.on('request', collect)
+              try:
+                  await page.goto(URL, wait_until='domcontentloaded', timeout=15_000)
+              except Exception as exc:
+                  print(f'ignore_https_errors={ignore_https_errors} navigation={type(exc).__name__}: {exc}')
+              await page.wait_for_timeout(5_000)
+
+              for frame in page.frames:
+                  try:
+                      videos = frame.locator('video')
+                      count = await videos.count()
+                      if count:
+                          data = await videos.evaluate_all(
+                              "els => els.map(v => ({src:v.src,currentSrc:v.currentSrc,paused:v.paused}))"
+                          )
+                          print(
+                              f'ignore_https_errors={ignore_https_errors} frame={frame.url} '
+                              f'videos={data}'
+                          )
+                          await videos.evaluate_all(
+                              "els => Promise.allSettled(els.map(async v => {v.muted=true; await v.play();}))"
+                          )
+                  except Exception as exc:
+                      print(f'frame inspect warning {type(exc).__name__}: {exc}')
+              await page.wait_for_timeout(4_000)
+              await context.close()
+              return sorted(streams)
+
+
+          @pytest.mark.asyncio
+          async def test_compare_debica_tls_contexts() -> None:
+              """Print evidence comparing strict and TLS-tolerant browser contexts."""
+              async with async_playwright() as playwright:
+                  browser = await playwright.chromium.launch(headless=True)
+                  strict = await observe(browser, ignore_https_errors=False)
+                  tolerant = await observe(browser, ignore_https_errors=True)
+                  await browser.close()
+
+              print(f'STRICT={strict}')
+              print(f'TOLERANT={tolerant}')
+              assert tolerant, 'TLS-tolerant context still observed no Dębica HLS request'
+          PY
+          python -m pytest -s -q /tmp/test_debica_tls.py
