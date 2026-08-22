@@ -6,6 +6,8 @@ import asyncio
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from .log import log
+
 
 def hour_start(moment: datetime) -> datetime:
     """Return the UTC clock-hour boundary containing ``moment``."""
@@ -76,8 +78,18 @@ async def record_one_hour_slice(
     output.parent.mkdir(parents=True, exist_ok=True)
     duration = seconds_until_next_hour(now)
 
+    log(
+        f"[ffmpeg] start {source_slug}/{camera_id}: duration={duration}s, "
+        f"output={output}, stream={stream_url}"
+    )
     # FFmpeg runs as an independent OS process; awaiting it keeps other cameras active.
     process = await asyncio.create_subprocess_exec(
         *build_ffmpeg_command(stream_url, output, duration)
     )
-    return await process.wait()
+    log(f"[ffmpeg] pid={process.pid} recording {source_slug}/{camera_id}")
+    returncode = await process.wait()
+    log(
+        f"[ffmpeg] exit {source_slug}/{camera_id}: "
+        f"pid={process.pid}, returncode={returncode}, output={output}"
+    )
+    return returncode
