@@ -1,13 +1,17 @@
 """Qdrant implementation of Winston's class-agnostic visual index."""
 
+from collections.abc import Sequence
 from typing import Protocol
 
 from qdrant_client import AsyncQdrantClient, models
 
 from winston.config import QdrantSettings
 from winston.embeddings.models import EmbeddingIdentity
+from winston.index.identity import timestamp_to_microseconds, visual_point_id
 from winston.index.models import (
     IncompatibleVisualIndexError,
+    IndexedVisual,
+    VisualIndexConfigurationError,
     VisualIndexError,
 )
 
@@ -36,7 +40,7 @@ class _CollectionInfo(Protocol):
 
 
 class _QdrantClient(Protocol):
-    """Minimal non-destructive Qdrant operations used by the visual index lifecycle."""
+    """Minimal non-destructive Qdrant operations used by Winston's visual index."""
 
     async def collection_exists(self, collection_name: str) -> bool:
         """Return whether the configured collection exists."""
@@ -54,6 +58,16 @@ class _QdrantClient(Protocol):
 
     async def get_collection(self, collection_name: str) -> _CollectionInfo:
         """Return the collection configuration needed for compatibility validation."""
+        ...
+
+    async def upsert(
+        self,
+        collection_name: str,
+        *,
+        points: list[models.PointStruct],
+        wait: bool,
+    ) -> object:
+        """Upsert one bounded batch of points."""
         ...
 
     async def close(self) -> None:
@@ -107,6 +121,37 @@ class QdrantVisualIndex:
             ) from exc
 
         self._identity = identity
+
+    async def upsert(self, visuals: Sequence[IndexedVisual]) -> None:
+        """Validate then idempotently upsert visual candidates in bounded sequential batches."""
+        identity = self._identity
+        if identity is None:
+            raise VisualIndexConfigurationError(
+                "ensure_compatible() must succeed before visual points can be upserted"
+            )
+
+        # Validate the complete logical batch before the first network write so an identity mismatch
+        # cannot leave only the compatible prefix persisted.
+        for visual in visuals:
+            if visual.embedding_identity != identity:
+                raise VisualIndexConfigurationError(
+                    "visual embedding identity does not match the identity accepted by ensure_compatible()"
+                )
+
+        batch_size = int(self._settings.upsert_batch_size)
+        for start in range(0, len(visuals), batch_size):
+            chunk = visuals[start : start + batch_size]
+            points = [self._point_from_visual(visual) for visual in chunk]
+            try:
+                await self._client.upsert(
+                    self._settings.collection,
+                    points=points,
+                    wait=True,
+                )
+            except Exception as exc:
+                raise VisualIndexError(
+                    f"Failed to upsert visual points into collection '{self._settings.collection}'"
+                ) from exc
 
     async def close(self) -> None:
         """Close the reusable Qdrant client held by this index session."""
@@ -177,6 +222,33 @@ class QdrantVisualIndex:
             "vector_name": self._settings.vector_name,
             "distance": VISUAL_DISTANCE_NAME,
         }
+
+    def _point_from_visual(self, visual: IndexedVisual) -> models.PointStruct:
+        """Map one validated Winston visual to a Qdrant point without raw media bytes."""
+        payload: dict[str, object] = {
+            "asset_id": visual.asset_id,
+            "source_path": visual.source_path,
+            "media_type": visual.media_type.value,
+            "sample_kind": visual.sample_kind.value,
+            "timestamp_seconds": visual.timestamp_seconds,
+            "timestamp_us": timestamp_to_microseconds(visual.timestamp_seconds),
+            "region_kind": visual.region_kind.value,
+            "region": {
+                "x": visual.region.x,
+                "y": visual.region.y,
+                "width": visual.region.width,
+                "height": visual.region.height,
+                "scale": visual.region.scale,
+            },
+            "model_id": visual.embedding_identity.model_id,
+            "dimension": visual.embedding_identity.dimension,
+            "preprocessing_version": visual.embedding_identity.preprocessing_version,
+        }
+        return models.PointStruct(
+            id=str(visual_point_id(visual)),
+            vector={self._settings.vector_name: visual.vector.tolist()},
+            payload=payload,
+        )
 
 
 def _distance_name(distance: models.Distance) -> str:
