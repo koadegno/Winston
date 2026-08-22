@@ -11,6 +11,7 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     data_dir: Path = Path("data")
+    ffmpeg_binary: str = "ffmpeg"
     ffprobe_binary: str = "ffprobe"
 
 
