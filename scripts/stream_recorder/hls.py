@@ -8,6 +8,8 @@ import re
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urljoin, urlparse
 
+import httpx
+
 from .discovery import fetch_text
 from .log import log
 
@@ -248,6 +250,34 @@ def _select_camera_candidates(candidate_urls: set[str]) -> list[str]:
     return selected
 
 
+def _is_certificate_verification_error(exc: BaseException) -> bool:
+    """Return whether an HTTP failure is specifically a TLS certificate verification error."""
+    if not isinstance(exc, httpx.ConnectError):
+        return False
+    current: BaseException | None = exc
+    while current is not None:
+        text = str(current).upper()
+        if "CERTIFICATE_VERIFY_FAILED" in text or "CERTIFICATE VERIFY FAILED" in text:
+            return True
+        current = current.__cause__
+    return False
+
+
+async def _fetch_hls_text(url: str, *, client: Any | None) -> tuple[str, str]:
+    """Fetch a discovered HLS playlist, retrying only broken-certificate endpoints insecurely."""
+    try:
+        return await fetch_text(url, client=client)
+    except Exception as exc:
+        if not _is_certificate_verification_error(exc):
+            raise
+
+    # This is intentionally scoped to a URL already observed as an HLS playlist. Normal source
+    # pages and all other HTTP traffic keep certificate verification enabled.
+    log(f"[hls] WARN TLS certificate verification failed; retrying HLS only: {url}")
+    async with httpx.AsyncClient(follow_redirects=True, verify=False) as insecure_client:
+        return await fetch_text(url, client=insecure_client)
+
+
 async def resolve_candidate(
     url: str,
     *,
@@ -256,7 +286,7 @@ async def resolve_candidate(
     """Resolve one HLS candidate into its best concrete stream and known variants."""
     log(f"[hls] resolve {url}")
     try:
-        text, final_url = await fetch_text(url, client=client)
+        text, final_url = await _fetch_hls_text(url, client=client)
     except Exception as exc:
         log(f"[hls] ERROR {url}: {type(exc).__name__}: {exc}")
         raise
