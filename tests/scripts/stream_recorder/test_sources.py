@@ -60,3 +60,12 @@ def test_repository_csv_contains_new_pribram_and_skyline_sources():
     assert by_id["131"].url.endswith("/santander/playa-del-sardinero.html")
     assert by_id["132"].url.endswith("/birmingham/sutton-coldfield.html")
     assert by_id["133"].url.endswith("/genova/boccadasse-genova.html")
+
+
+def test_repository_csv_preserves_urls_that_contain_commas():
+    """CSV quoting must preserve source URLs whose paths themselves contain commas."""
+    sources = load_sources(Path("Place_Overview.csv"))
+    by_id = {source.id: source for source in sources}
+
+    assert by_id["105"].url == "https://www.brzesko.pl/artykul/150,kamera"
+    assert by_id["114"].url == "https://www.tvbraniewo24.pl/kamery/22,frombork-rynek"
