@@ -1,10 +1,12 @@
-"""Load and normalize public webcam sources from Place_Overview.xlsb."""
+"""Load and normalize public webcam sources from CSV or legacy XLSB files."""
 
 from __future__ import annotations
 
+import csv
 from dataclasses import dataclass
 from pathlib import Path
 import re
+from typing import Mapping
 import unicodedata
 from urllib.parse import urlparse
 
@@ -25,7 +27,7 @@ def is_youtube_url(url: str) -> bool:
 
 @dataclass(frozen=True, slots=True)
 class Source:
-    """Describe one public webcam source page from the source spreadsheet."""
+    """Describe one public webcam source page from the source list."""
 
     id: str
     place: str
@@ -53,26 +55,78 @@ class Source:
 
 
 def _cell_to_id(value: object) -> str:
-    """Normalize XLSB numeric identifiers without a trailing decimal fraction."""
+    """Normalize legacy spreadsheet numeric identifiers without a decimal suffix."""
     if isinstance(value, float) and value.is_integer():
         return str(int(value))
     return str(value).strip()
 
 
-def load_sources(path: str | Path) -> list[Source]:
-    """Load all non-YouTube public webcam source rows from Place_Overview.xlsb."""
+def _is_enabled(value: object | None) -> bool:
+    """Interpret an optional source-list enabled flag with enabled as the safe default."""
+    if value is None:
+        return True
+    normalized = str(value).strip().lower()
+    if not normalized:
+        return True
+    return normalized not in {"0", "false", "no", "off", "disabled"}
+
+
+def _source_from_mapping(row: Mapping[str, object | None]) -> Source | None:
+    """Build one enabled, non-YouTube source from canonical or legacy column names."""
+    if not _is_enabled(row.get("enabled")):
+        return None
+
+    url_value = row.get("url") or row.get("Link")
+    if not url_value:
+        return None
+    url = str(url_value).strip()
+    if is_youtube_url(url):
+        # YouTube, including YouTube Live, is explicitly out of scope.
+        return None
+
+    identifier = row.get("id") if row.get("id") is not None else row.get("No.")
+    description_value = row.get("description") or row.get("Short description")
+    return Source(
+        id=_cell_to_id(identifier),
+        place=str(row.get("place") or row.get("Place Name") or "unknown").strip(),
+        city=str(row.get("city") or row.get("City") or "unknown").strip(),
+        country=str(row.get("country") or row.get("Country") or "unknown").strip(),
+        url=url,
+        description=str(description_value).strip() if description_value else None,
+    )
+
+
+def _load_csv_sources(path: Path) -> list[Source]:
+    """Load enabled sources from the maintainable UTF-8 CSV source list."""
+    result: list[Source] = []
+    with path.open("r", encoding="utf-8-sig", newline="") as handle:
+        reader = csv.DictReader(handle)
+        required = {"id", "place", "city", "country", "url"}
+        if reader.fieldnames is None or not required.issubset(reader.fieldnames):
+            raise ValueError(
+                "CSV source list must contain id, place, city, country, and url columns"
+            )
+        for row in reader:
+            source = _source_from_mapping(row)
+            if source is not None:
+                result.append(source)
+    return result
+
+
+def _load_xlsb_sources(path: Path) -> list[Source]:
+    """Load enabled non-YouTube sources from the legacy XLSB dataset workbook."""
     try:
         from pyxlsb import open_workbook
     except ImportError as exc:
         raise RuntimeError("pyxlsb is required to read Place_Overview.xlsb") from exc
 
-    result: list[Source] = []
     with open_workbook(str(path)) as workbook:
         if not workbook.sheets:
-            return result
+            return []
         with workbook.get_sheet(workbook.sheets[0]) as sheet:
             rows = [[cell.v for cell in row] for row in sheet.rows()]
 
+    result: list[Source] = []
     header_index: dict[str, int] | None = None
     for values in rows:
         candidate = {
@@ -86,36 +140,22 @@ def load_sources(path: str | Path) -> list[Source]:
         if header_index is None:
             continue
 
-        def get(name: str) -> object | None:
-            """Return one named cell from the current row when the column exists."""
-            index = header_index[name]
-            return values[index] if index < len(values) else None
-
-        url_value = get("Link")
-        if not url_value:
-            continue
-        url = str(url_value).strip()
-        if is_youtube_url(url):
-            # YouTube, including YouTube Live, is explicitly out of scope.
-            continue
-
-        place = str(get("Place Name") or "unknown").strip()
-        city = str(get("City") or "unknown").strip()
-        country = str(get("Country") or "unknown").strip()
-        description = None
-        if "Short description" in header_index:
-            raw_description = get("Short description")
-            if raw_description:
-                description = str(raw_description).strip()
-        result.append(
-            Source(
-                id=_cell_to_id(get("No.")),
-                place=place,
-                city=city,
-                country=country,
-                url=url,
-                description=description,
-            )
-        )
-
+        row = {
+            name: values[index] if index < len(values) else None
+            for name, index in header_index.items()
+        }
+        source = _source_from_mapping(row)
+        if source is not None:
+            result.append(source)
     return result
+
+
+def load_sources(path: str | Path) -> list[Source]:
+    """Load enabled public webcam sources from CSV or the legacy XLSB workbook."""
+    source_path = Path(path)
+    suffix = source_path.suffix.lower()
+    if suffix == ".csv":
+        return _load_csv_sources(source_path)
+    if suffix == ".xlsb":
+        return _load_xlsb_sources(source_path)
+    raise ValueError(f"Unsupported source-list format: {source_path.suffix or '<none>'}")
