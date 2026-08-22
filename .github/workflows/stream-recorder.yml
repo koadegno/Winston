@@ -36,6 +36,162 @@ jobs:
         run: python -m pytest tests/scripts/stream_recorder -q
       - name: Install Chromium
         run: python -m playwright install --with-deps chromium
+
+      - name: Diagnose Debica request context and Skyline session isolation
+        shell: bash
+        run: |
+          python - <<'PY'
+          import asyncio
+          import httpx
+          from urllib.parse import parse_qs, urlparse
+          from playwright.async_api import async_playwright
+
+          DEBICA_PAGE = 'https://www.kamery24.org/i24/index.php/test/82-debica-rynek'
+          DEBICA_HLS = 'online2.kamery24.org/cam/debica.m3u8'
+          SKYLINE = {
+              'villamartin': 'https://www.skylinewebcams.com/en/webcam/espana/andalucia/cadiz/villamartin-plaza-del-ayuntamiento.html',
+              'santander': 'https://www.skylinewebcams.com/en/webcam/espana/cantabria/santander/playa-del-sardinero.html',
+              'sutton': 'https://www.skylinewebcams.com/en/webcam/united-kingdom/england/birmingham/sutton-coldfield.html',
+              'boccadasse': 'https://www.skylinewebcams.com/en/webcam/italia/liguria/genova/boccadasse-genova.html',
+          }
+
+          async def debica(browser) -> None:
+              """Compare Dębica browser request context with direct HTTP probes."""
+              context = await browser.new_context(ignore_https_errors=True)
+              page = await context.new_page()
+              observed = asyncio.get_running_loop().create_future()
+
+              async def inspect(request) -> None:
+                  """Capture request metadata without printing cookie values."""
+                  if DEBICA_HLS not in request.url or observed.done():
+                      return
+                  headers = await request.all_headers()
+                  response = await request.response()
+                  cookies = await context.cookies(request.url)
+                  observed.set_result({
+                      'url': request.url,
+                      'status': response.status if response else None,
+                      'referer': headers.get('referer'),
+                      'origin': headers.get('origin'),
+                      'user-agent': headers.get('user-agent'),
+                      'accept': headers.get('accept'),
+                      'cookie_header_present': bool(headers.get('cookie')),
+                      'cookie_names': sorted(cookie['name'] for cookie in cookies),
+                  })
+
+              def collect(request) -> None:
+                  """Schedule metadata capture for the HLS request only."""
+                  if DEBICA_HLS in request.url:
+                      asyncio.create_task(inspect(request))
+
+              page.on('request', collect)
+              await page.goto(DEBICA_PAGE, wait_until='domcontentloaded', timeout=20_000)
+              result = await asyncio.wait_for(observed, timeout=10)
+              print('DEBICA_BROWSER=', result)
+
+              browser_headers = {
+                  key: value for key, value in {
+                      'Referer': result['referer'],
+                      'Origin': result['origin'],
+                      'User-Agent': result['user-agent'],
+                      'Accept': result['accept'],
+                  }.items() if value
+              }
+              browser_cookies = {
+                  cookie['name']: cookie['value']
+                  for cookie in await context.cookies(result['url'])
+              }
+              async with httpx.AsyncClient(verify=False, follow_redirects=True) as client:
+                  probes = (
+                      ('plain', {}, None),
+                      ('referer', {'Referer': DEBICA_PAGE}, None),
+                      ('browser_headers', browser_headers, None),
+                      ('browser_headers_and_cookies', browser_headers, browser_cookies),
+                  )
+                  for name, headers, cookies in probes:
+                      try:
+                          response = await client.get(result['url'], headers=headers, cookies=cookies, timeout=10)
+                          print(
+                              f'DEBICA_PROBE {name}: status={response.status_code} '
+                              f'content_type={response.headers.get("content-type")} bytes={len(response.content)}'
+                          )
+                      except Exception as exc:
+                          print(f'DEBICA_PROBE {name}: ERROR {type(exc).__name__}: {exc}')
+              await context.close()
+
+          async def observe_skyline(context, name, url):
+              """Observe one Skyline page and click its video when autoplay produced no HLS."""
+              page = await context.new_page()
+              streams = set()
+
+              def collect(request) -> None:
+                  """Collect only HLS requests from this source tab and its frame tree."""
+                  if '.m3u8' in request.url.lower():
+                      streams.add(request.url)
+
+              page.on('request', collect)
+              try:
+                  await page.goto(url, wait_until='domcontentloaded', timeout=15_000)
+              except Exception as exc:
+                  print(f'SKYLINE {name} navigation={type(exc).__name__}:{exc}')
+              await page.wait_for_timeout(4_000)
+              if not streams:
+                  videos = page.locator('video')
+                  if await videos.count():
+                      try:
+                          await videos.first.click(force=True, timeout=2_000)
+                          print(f'SKYLINE {name} CLICK')
+                      except Exception as exc:
+                          print(f'SKYLINE {name} click={type(exc).__name__}:{exc}')
+              await page.wait_for_timeout(6_000)
+              print(f'SKYLINE {name} streams={sorted(streams)}')
+              await page.close()
+              return streams
+
+          def auth_token(streams):
+              """Extract the Skyline hd-auth token for compact session comparison."""
+              for stream in streams:
+                  parsed = urlparse(stream)
+                  if parsed.hostname == 'hd-auth.skylinewebcams.com':
+                      return parse_qs(parsed.query).get('a', [None])[0]
+              return None
+
+          async def skyline(browser) -> None:
+              """Compare shared-context tabs with isolated contexts in the same Chromium process."""
+              shared = await browser.new_context()
+              shared_results = await asyncio.gather(*(
+                  observe_skyline(shared, name, url)
+                  for name, url in SKYLINE.items()
+              ))
+              print('SKYLINE_SHARED_TOKENS=', {
+                  name: auth_token(streams)
+                  for name, streams in zip(SKYLINE, shared_results, strict=True)
+              })
+              await shared.close()
+
+              contexts = {name: await browser.new_context() for name in SKYLINE}
+              isolated_results = await asyncio.gather(*(
+                  observe_skyline(contexts[name], name, url)
+                  for name, url in SKYLINE.items()
+              ))
+              print('SKYLINE_ISOLATED_TOKENS=', {
+                  name: auth_token(streams)
+                  for name, streams in zip(SKYLINE, isolated_results, strict=True)
+              })
+              for context in contexts.values():
+                  await context.close()
+
+          async def main() -> None:
+              """Run both diagnostics while keeping one Chromium process."""
+              async with async_playwright() as playwright:
+                  browser = await playwright.chromium.launch(headless=True)
+                  await debica(browser)
+                  await skyline(browser)
+                  await browser.close()
+
+          asyncio.run(main())
+          PY
+
       - name: Discover Brussels and Prijedor HLS webcams
         shell: bash
         run: |
