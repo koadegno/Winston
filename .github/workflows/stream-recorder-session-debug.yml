@@ -1,0 +1,203 @@
+name: Stream recorder session diagnostics
+
+on:
+  push:
+    branches:
+      - feat/public-stream-recorder
+    paths:
+      - '.github/workflows/stream-recorder-session-debug.yml'
+  workflow_dispatch:
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install diagnostics dependencies
+        run: |
+          python -m pip install 'playwright>=1.62.0' 'httpx>=0.28.1'
+          python -m playwright install --with-deps chromium
+      - name: Diagnose Debica request requirements
+        shell: bash
+        run: |
+          python - <<'PY'
+          import asyncio
+          import httpx
+          from playwright.async_api import async_playwright
+
+          PAGE_URL = 'https://www.kamery24.org/i24/index.php/test/82-debica-rynek'
+          HLS_MARKER = 'online2.kamery24.org/cam/debica.m3u8'
+
+          async def main() -> None:
+              """Compare the successful browser HLS request with controlled direct HTTP requests."""
+              async with async_playwright() as playwright:
+                  browser = await playwright.chromium.launch(headless=True)
+                  context = await browser.new_context(ignore_https_errors=True)
+                  page = await context.new_page()
+                  observed = asyncio.Future()
+
+                  async def inspect_request(request) -> None:
+                      """Capture non-secret request context from the browser HLS request."""
+                      if HLS_MARKER not in request.url or observed.done():
+                          return
+                      headers = await request.all_headers()
+                      cookies = await context.cookies(request.url)
+                      response = await request.response()
+                      result = {
+                          'url': request.url,
+                          'status': response.status if response else None,
+                          'referer': headers.get('referer'),
+                          'origin': headers.get('origin'),
+                          'user-agent': headers.get('user-agent'),
+                          'accept': headers.get('accept'),
+                          'cookie_header_present': bool(headers.get('cookie')),
+                          'cookie_names': sorted(cookie['name'] for cookie in cookies),
+                      }
+                      observed.set_result(result)
+
+                  def on_request(request) -> None:
+                      """Schedule async inspection only for the Dębica HLS request."""
+                      if HLS_MARKER in request.url:
+                          asyncio.create_task(inspect_request(request))
+
+                  page.on('request', on_request)
+                  await page.goto(PAGE_URL, wait_until='domcontentloaded', timeout=20_000)
+                  result = await asyncio.wait_for(observed, timeout=10)
+                  print('BROWSER=', result)
+
+                  request_headers = {
+                      key: value
+                      for key, value in {
+                          'Referer': result['referer'],
+                          'Origin': result['origin'],
+                          'User-Agent': result['user-agent'],
+                          'Accept': result['accept'],
+                      }.items()
+                      if value
+                  }
+                  cookies = {
+                      cookie['name']: cookie['value']
+                      for cookie in await context.cookies(result['url'])
+                  }
+
+                  async with httpx.AsyncClient(verify=False, follow_redirects=True) as client:
+                      probes = [
+                          ('plain', {}, None),
+                          ('referer', {'Referer': PAGE_URL}, None),
+                          ('browser_headers', request_headers, None),
+                          ('browser_headers_and_cookies', request_headers, cookies),
+                      ]
+                      for name, headers, probe_cookies in probes:
+                          try:
+                              response = await client.get(
+                                  result['url'],
+                                  headers=headers,
+                                  cookies=probe_cookies,
+                                  timeout=10,
+                              )
+                              print(
+                                  f'PROBE {name}: status={response.status_code} '
+                                  f'content_type={response.headers.get("content-type")} bytes={len(response.content)}'
+                              )
+                          except Exception as exc:
+                              print(f'PROBE {name}: ERROR {type(exc).__name__}: {exc}')
+
+                  await page.close()
+                  await context.close()
+                  await browser.close()
+
+          asyncio.run(main())
+          PY
+
+      - name: Compare shared and isolated Skyline browser contexts
+        shell: bash
+        run: |
+          python - <<'PY'
+          import asyncio
+          from urllib.parse import parse_qs, urlparse
+          from playwright.async_api import async_playwright
+
+          TARGETS = {
+              'villamartin': 'https://www.skylinewebcams.com/en/webcam/espana/andalucia/cadiz/villamartin-plaza-del-ayuntamiento.html',
+              'santander': 'https://www.skylinewebcams.com/en/webcam/espana/cantabria/santander/playa-del-sardinero.html',
+              'sutton': 'https://www.skylinewebcams.com/en/webcam/united-kingdom/england/birmingham/sutton-coldfield.html',
+              'boccadasse': 'https://www.skylinewebcams.com/en/webcam/italia/liguria/genova/boccadasse-genova.html',
+          }
+
+          async def observe(context, name, url):
+              """Open one Skyline page, click its video if needed, and return observed HLS requests."""
+              page = await context.new_page()
+              streams = set()
+
+              def collect(request) -> None:
+                  """Collect HLS requests belonging to this page and its frame tree."""
+                  if '.m3u8' in request.url.lower():
+                      streams.add(request.url)
+
+              page.on('request', collect)
+              try:
+                  await page.goto(url, wait_until='domcontentloaded', timeout=15_000)
+              except Exception as exc:
+                  print(f'{name} navigation: {type(exc).__name__}: {exc}')
+              await page.wait_for_timeout(4_000)
+              if not streams:
+                  videos = page.locator('video')
+                  if await videos.count():
+                      try:
+                          await videos.first.click(force=True, timeout=2_000)
+                          print(f'{name} CLICK')
+                      except Exception as exc:
+                          print(f'{name} click: {type(exc).__name__}: {exc}')
+              await page.wait_for_timeout(6_000)
+              print(f'{name} streams={sorted(streams)}')
+              await page.close()
+              return streams
+
+          def token(streams):
+              """Return the hd-auth token when one is present for compact comparison."""
+              for stream in streams:
+                  parsed = urlparse(stream)
+                  if parsed.hostname == 'hd-auth.skylinewebcams.com':
+                      return parse_qs(parsed.query).get('a', [None])[0]
+              return None
+
+          async def main() -> None:
+              """Compare session behavior while keeping exactly one Chromium process."""
+              async with async_playwright() as playwright:
+                  browser = await playwright.chromium.launch(headless=True)
+
+                  print('=== SHARED CONTEXT ===')
+                  shared = await browser.new_context()
+                  shared_results = await asyncio.gather(*(
+                      observe(shared, name, url)
+                      for name, url in TARGETS.items()
+                  ))
+                  print('SHARED TOKENS=', {
+                      name: token(streams)
+                      for name, streams in zip(TARGETS, shared_results, strict=True)
+                  })
+                  await shared.close()
+
+                  print('=== ISOLATED CONTEXTS, SAME CHROMIUM ===')
+                  contexts = {
+                      name: await browser.new_context()
+                      for name in TARGETS
+                  }
+                  isolated_results = await asyncio.gather(*(
+                      observe(contexts[name], name, url)
+                      for name, url in TARGETS.items()
+                  ))
+                  print('ISOLATED TOKENS=', {
+                      name: token(streams)
+                      for name, streams in zip(TARGETS, isolated_results, strict=True)
+                  })
+                  for context in contexts.values():
+                      await context.close()
+                  await browser.close()
+
+          asyncio.run(main())
+          PY
