@@ -129,7 +129,7 @@ def test_index_command_maps_fatal_run_error_to_stderr_and_exit_one(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """Fatal initialization/cleanup errors must produce a concise non-zero CLI result."""
+    """Fatal initialization/cleanup errors must produce progress context and a concise failure."""
     async def fake_run_indexing(root: Path, settings: Settings) -> IndexRunResult:
         """Inject one fatal run-level failure."""
         raise IndexingRunError("manifest corrupt")
@@ -139,4 +139,7 @@ def test_index_command_maps_fatal_run_error_to_stderr_and_exit_one(
     assert main(["index", str(tmp_path)]) == 1
     captured = capsys.readouterr()
     assert captured.out == ""
-    assert captured.err == "Indexing failed: manifest corrupt\n"
+    assert captured.err == (
+        f"Winston index: {tmp_path.resolve()}\n"
+        "Indexing failed: manifest corrupt\n"
+    )
