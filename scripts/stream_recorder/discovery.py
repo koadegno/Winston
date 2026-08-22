@@ -24,6 +24,7 @@ DEFAULT_BROWSER_PAGE_CLOSE_TIMEOUT_SECONDS = 2.0
 DEFAULT_BROWSER_SHUTDOWN_TIMEOUT_SECONDS = 5.0
 DEFAULT_HTTP_CONNECTIONS = 32
 DEFAULT_HTTP_TIMEOUT_SECONDS = 10.0
+DEFAULT_HTTP_TOTAL_TIMEOUT_SECONDS = 12.0
 _BROWSER_STREAM_GRACE_MS = 750
 
 _M3U8_RE = re.compile(
@@ -209,14 +210,25 @@ async def fetch_text(
     url: str,
     *,
     client: Any | None = None,
+    total_timeout_seconds: float = DEFAULT_HTTP_TOTAL_TIMEOUT_SECONDS,
 ) -> tuple[str, str]:
-    """Fetch text through a supplied/shared async HTTP client."""
+    """Fetch text through async HTTP with a strict total wall-clock request deadline."""
+    if total_timeout_seconds <= 0:
+        raise ValueError("total_timeout_seconds must be greater than 0")
     if client is None:
         # Standalone callers still get true async I/O; batch callers pass one shared client.
         async with http_session() as local_client:
-            return await fetch_text(url, client=local_client)
+            return await fetch_text(
+                url,
+                client=local_client,
+                total_timeout_seconds=total_timeout_seconds,
+            )
 
-    response = await client.get(url)
+    response = await _await_bounded(
+        client.get(url),
+        timeout_seconds=total_timeout_seconds,
+        operation=f"HTTP GET {url}",
+    )
     response.raise_for_status()
     return response.text, str(response.url)
 
@@ -245,7 +257,7 @@ async def discover_http(
 
 
 def _consume_background_task(task: asyncio.Task[Any]) -> None:
-    """Consume a detached task result so abandoned Playwright calls do not emit warnings."""
+    """Consume a detached task result so abandoned transport calls do not emit warnings."""
     if task.cancelled():
         return
     try:
@@ -268,8 +280,8 @@ async def _await_bounded(
     task = asyncio.ensure_future(awaitable)
     done, _ = await asyncio.wait({task}, timeout=timeout_seconds)
     if task not in done:
-        # Crucially, cancel but DO NOT await this task. Some Playwright transport operations can
-        # suppress/delay cancellation, which previously defeated asyncio.timeout()/wait_for().
+        # Crucially, cancel but DO NOT await this task. Some network/Playwright transport calls can
+        # suppress or delay cancellation, which would defeat asyncio.timeout()/wait_for().
         task.cancel()
         task.add_done_callback(_consume_background_task)
         raise _BoundedOperationTimeout(
