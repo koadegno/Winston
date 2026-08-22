@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import json
 from pathlib import Path
@@ -25,6 +25,55 @@ class Camera:
     stream: HlsVariant
 
 
+@dataclass(slots=True)
+class SourceRediscovery:
+    """Coalesce concurrent rediscovery requests for all cameras of one source."""
+
+    source: Source
+    http: Any | None
+    browser: Any | None
+    _lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False)
+    _in_flight: asyncio.Task[list[Camera]] | None = field(default=None, init=False)
+
+    async def _cameras(self) -> list[Camera]:
+        """Return one shared in-flight source rediscovery result."""
+        async with self._lock:
+            task = self._in_flight
+            if task is None:
+                log(f"[source {self.source.id}] starting shared rediscovery")
+                task = asyncio.create_task(
+                    discover_source_cameras(
+                        self.source,
+                        client=self.http,
+                        browser=self.browser,
+                    )
+                )
+                self._in_flight = task
+            else:
+                log(f"[source {self.source.id}] joining shared rediscovery")
+
+        try:
+            return await task
+        finally:
+            # Clear only the task this caller actually awaited; a later cycle may already exist.
+            async with self._lock:
+                if self._in_flight is task and task.done():
+                    self._in_flight = None
+
+    async def camera(self, camera_id: str) -> Camera | None:
+        """Return one camera from the shared rediscovery result by deterministic ID."""
+        cameras = await self._cameras()
+        replacement = next((camera for camera in cameras if camera.id == camera_id), None)
+        if replacement is None:
+            log(f"[source {self.source.id}/{camera_id}] rediscovery found no matching camera")
+        else:
+            log(
+                f"[source {self.source.id}/{camera_id}] rediscovery selected "
+                f"{replacement.stream.url}"
+            )
+        return replacement
+
+
 def assign_camera_ids(streams: list[HlsVariant]) -> list[Camera]:
     """Assign stable-in-order camera IDs after sorting resolved stream URLs."""
     ordered = sorted(streams, key=lambda stream: stream.url)
@@ -36,19 +85,22 @@ def assign_camera_ids(streams: list[HlsVariant]) -> list[Camera]:
 
 async def discover_source_cameras(
     source: Source,
-    use_browser_fallback: bool = True,
+    use_browser: bool = True,
     *,
+    client: Any | None = None,
     browser: Any | None = None,
 ) -> list[Camera]:
     """Discover and resolve every logical HLS camera exposed by one source page."""
     log(f"[source {source.id}] discovery start: {source.place} - {source.url}")
     candidates = await discover_page(
         source.url,
-        use_browser_fallback=use_browser_fallback,
+        use_browser=use_browser,
         browser=browser,
+        client=client,
+        label=f"source {source.id}",
     )
     log(f"[source {source.id}] {len(candidates)} HLS candidate(s); resolving cameras")
-    cameras = assign_camera_ids(await resolve_cameras(candidates))
+    cameras = assign_camera_ids(await resolve_cameras(candidates, client=client))
     log(f"[source {source.id}] discovery complete: {len(cameras)} camera(s)")
     return cameras
 
@@ -116,29 +168,14 @@ def write_camera_metadata(
     )
 
 
-async def _rediscover_camera(
-    source: Source,
-    camera_id: str,
-    *,
-    browser: Any | None = None,
-) -> Camera | None:
-    """Re-run source discovery and return the camera matching ``camera_id``."""
-    log(f"[source {source.id}/{camera_id}] rediscovery start")
-    cameras = await discover_source_cameras(source, browser=browser)
-    replacement = next((camera for camera in cameras if camera.id == camera_id), None)
-    if replacement is None:
-        log(f"[source {source.id}/{camera_id}] rediscovery found no matching camera")
-    else:
-        log(f"[source {source.id}/{camera_id}] rediscovery selected {replacement.stream.url}")
-    return replacement
-
-
 async def record_camera_loop(
     source: Source,
     camera_id: str,
     initial_stream: HlsVariant,
     output_root: Path,
     *,
+    rediscovery: SourceRediscovery | None = None,
+    client: Any | None = None,
     browser: Any | None = None,
     retry_seconds: float = 10.0,
     max_cycles: int | None = None,
@@ -146,6 +183,7 @@ async def record_camera_loop(
     """Continuously record one camera and rediscover its HLS URL after failures."""
     stream = initial_stream
     cycles = 0
+    coordinator = rediscovery or SourceRediscovery(source, http=client, browser=browser)
     log(f"[source {source.id}/{camera_id}] recorder started: {stream.url}")
     while max_cycles is None or cycles < max_cycles:
         cycles += 1
@@ -167,11 +205,7 @@ async def record_camera_loop(
         )
         # Async sleep keeps every other source and camera recording during backoff.
         await asyncio.sleep(retry_seconds)
-        replacement = await _rediscover_camera(
-            source,
-            camera_id,
-            browser=browser,
-        )
+        replacement = await coordinator.camera(camera_id)
         if replacement is not None:
             stream = replacement.stream
 
@@ -180,17 +214,19 @@ async def record_source_forever(
     source: Source,
     output_root: Path,
     *,
+    client: Any | None = None,
     browser: Any | None = None,
 ) -> None:
     """Discover one source and run all of its camera recorders concurrently."""
     log(f"[source {source.id}] recorder source task started: {source.place}")
-    cameras = await discover_source_cameras(source, browser=browser)
+    cameras = await discover_source_cameras(source, client=client, browser=browser)
     if not cameras:
         raise RuntimeError(f"No HLS stream found for {source.url}")
 
     write_source_metadata(output_root, source, cameras)
+    rediscovery = SourceRediscovery(source, http=client, browser=browser)
     log(f"[source {source.id}] starting {len(cameras)} FFmpeg camera task(s)")
-    # Camera loops are independent long-lived jobs and must start together.
+    # Camera loops are independent long-lived jobs and share one source rediscovery coordinator.
     await asyncio.gather(
         *(
             record_camera_loop(
@@ -198,6 +234,8 @@ async def record_source_forever(
                 camera.id,
                 camera.stream,
                 output_root,
+                rediscovery=rediscovery,
+                client=client,
                 browser=browser,
             )
             for camera in cameras

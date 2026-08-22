@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 import re
+from typing import Any
 from urllib.parse import urljoin
 
 from .discovery import fetch_text
@@ -85,11 +86,15 @@ def choose_best_stream(variants: list[HlsVariant]) -> HlsVariant:
     return max(variants, key=lambda item: (item.pixels, item.bandwidth))
 
 
-async def resolve_candidate(url: str) -> tuple[HlsVariant, set[str]]:
+async def resolve_candidate(
+    url: str,
+    *,
+    client: Any | None = None,
+) -> tuple[HlsVariant, set[str]]:
     """Resolve one HLS candidate into its best concrete stream and known variants."""
     log(f"[hls] resolve {url}")
     try:
-        text, final_url = await fetch_text(url)
+        text, final_url = await fetch_text(url, client=client)
     except Exception as exc:
         log(f"[hls] ERROR {url}: {type(exc).__name__}: {exc}")
         raise
@@ -112,14 +117,24 @@ async def resolve_candidate(url: str) -> tuple[HlsVariant, set[str]]:
     return best, {variant.url for variant in variants}
 
 
-async def resolve_cameras(candidate_urls: set[str]) -> list[HlsVariant]:
+async def resolve_cameras(
+    candidate_urls: set[str],
+    *,
+    client: Any | None = None,
+) -> list[HlsVariant]:
     """Resolve all HLS candidates concurrently and deduplicate logical cameras."""
     ordered_urls = sorted(candidate_urls)
     log(f"[hls] resolving {len(ordered_urls)} candidate playlist(s) in parallel")
 
+    async def resolve_one(url: str) -> tuple[HlsVariant, set[str]]:
+        """Resolve one candidate while preserving monkeypatch-friendly optional clients."""
+        if client is None:
+            return await resolve_candidate(url)
+        return await resolve_candidate(url, client=client)
+
     # Candidate playlists are independent network requests, so resolve them together.
     results = await asyncio.gather(
-        *(resolve_candidate(url) for url in ordered_urls),
+        *(resolve_one(url) for url in ordered_urls),
         return_exceptions=True,
     )
 

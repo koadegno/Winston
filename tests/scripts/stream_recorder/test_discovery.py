@@ -22,131 +22,77 @@ def test_extracts_absolute_relative_and_escaped_m3u8_urls():
 
 
 @pytest.mark.asyncio
-async def test_http_discovery_leaves_iframe_loading_to_browser(monkeypatch):
-    """HTTP discovery only fetches the source page and never follows third-party iframes."""
+async def test_http_discovery_fetches_only_source_page():
+    """HTTP discovery reads one page response and never follows embedded third-party URLs."""
     calls: list[str] = []
-    page = '<iframe src="https://third-party.example/player"></iframe>'
 
-    async def fake_fetch(url: str, timeout: float = 20.0):
-        """Return the synthetic source page and record HTTP calls."""
-        calls.append(url)
-        if url != "https://example.test/page":
-            raise AssertionError("HTTP discovery must not fetch third-party iframes")
-        return page, url
+    class Response:
+        """Provide one HTML response containing an iframe and HLS URL."""
 
-    monkeypatch.setattr("scripts.stream_recorder.discovery.fetch_text", fake_fetch)
-    assert await discover_http("https://example.test/page") == set()
+        text = (
+            '<iframe src="https://third-party.example/player"></iframe>'
+            '<script>const stream="/live/camera.m3u8";</script>'
+        )
+        url = "https://example.test/page"
+
+        def raise_for_status(self) -> None:
+            """Model a successful response."""
+            return None
+
+    class Client:
+        """Record exactly which URLs HTTP discovery requests."""
+
+        async def get(self, url: str) -> Response:
+            """Return the synthetic source page."""
+            calls.append(url)
+            return Response()
+
+    assert await discover_http("https://example.test/page", client=Client()) == {
+        "https://example.test/live/camera.m3u8"
+    }
     assert calls == ["https://example.test/page"]
 
 
 @pytest.mark.asyncio
-async def test_browser_discovery_visits_iframe_urls_as_independent_targets():
-    """Browser crawling follows iframe URLs as isolated targets when the parent has no stream."""
-    root_url = "https://example.test/webcam"
-    player_url = "https://player.example/embed/123"
-    stream_url = "https://cdn.example/live/camera.m3u8"
-    visited: list[str] = []
-
-    async def visit(url: str) -> tuple[set[str], set[str]]:
-        """Return a child player from the root and an HLS stream from the player."""
-        visited.append(url)
-        if url == root_url:
-            return set(), {player_url}
-        if url == player_url:
-            return {stream_url}, set()
-        raise AssertionError(f"unexpected target: {url}")
-
-    assert await discovery.crawl_browser_targets(root_url, visit, max_iframe_depth=1) == {stream_url}
-    assert visited == [root_url, player_url]
-
-
-@pytest.mark.asyncio
-async def test_browser_does_not_crawl_iframes_after_parent_finds_stream():
-    """A target that already exposes HLS must not enqueue its iframe children."""
-    root_url = "https://example.test/webcam"
-    child_url = "https://player.example/unnecessary"
-    stream_url = "https://cdn.example/live/camera.m3u8"
-    visited: list[str] = []
-
-    async def visit(url: str) -> tuple[set[str], set[str]]:
-        """Expose one stream and one irrelevant child from the root page."""
-        visited.append(url)
-        if url == root_url:
-            return {stream_url}, {child_url}
-        return set(), set()
-
-    assert await discovery.crawl_browser_targets(root_url, visit, max_iframe_depth=1) == {stream_url}
-    assert visited == [root_url]
-
-
-@pytest.mark.asyncio
-async def test_browser_target_siblings_start_concurrently():
-    """Sibling player targets at one iframe depth start concurrently."""
-    root_url = "https://example.test/root"
-    children = {"https://player.example/a", "https://player.example/b"}
-    both_started = asyncio.Event()
-    started: set[str] = set()
-
-    async def visit(url: str) -> tuple[set[str], set[str]]:
-        """Block each child until both sibling visits have started."""
-        if url == root_url:
-            return set(), children
-        started.add(url)
-        if len(started) == len(children):
-            both_started.set()
-        await asyncio.wait_for(both_started.wait(), timeout=0.1)
-        return {f"{url}/stream.m3u8"}, set()
-
-    streams = await discovery.crawl_browser_targets(root_url, visit, max_iframe_depth=1)
-    assert streams == {f"{url}/stream.m3u8" for url in children}
-
-
-@pytest.mark.asyncio
-async def test_http_and_browser_layers_run_concurrently(monkeypatch):
-    """Direct HTTP and browser observation both run so dynamic cameras are not missed."""
-    both_started = asyncio.Event()
-    started: set[str] = set()
+async def test_discover_page_runs_http_before_browser(monkeypatch):
+    """Single-page discovery finishes HTTP before starting its one browser page."""
+    order: list[str] = []
     sentinel = object()
 
-    async def wait_for_peer(name: str, result: set[str]) -> set[str]:
-        """Wait until both independent discovery layers have entered."""
-        started.add(name)
-        if len(started) == 2:
-            both_started.set()
-        await asyncio.wait_for(both_started.wait(), timeout=0.1)
-        return result
+    async def fake_http(_url: str, **_kwargs) -> set[str]:
+        """Record completion of the HTTP stage."""
+        order.append("http-start")
+        await asyncio.sleep(0)
+        order.append("http-done")
+        return {"https://example.test/static.m3u8"}
 
-    async def fake_http(_url: str) -> set[str]:
-        """Simulate the direct HTTP layer."""
-        return await wait_for_peer("http", {"https://example.test/http.m3u8"})
-
-    async def fake_browser(_url: str, *, browser) -> set[str]:
-        """Simulate the browser network-observation layer."""
+    async def fake_browser(_url: str, *, browser, **_kwargs) -> set[str]:
+        """Assert browser observation starts only after HTTP completed."""
         assert browser is sentinel
-        return await wait_for_peer("browser", {"https://example.test/browser.m3u8"})
+        order.append("browser-start")
+        return {"https://example.test/dynamic.m3u8"}
 
     monkeypatch.setattr(discovery, "discover_http", fake_http)
     monkeypatch.setattr(discovery, "discover_browser", fake_browser)
-    streams = await discovery.discover_page("https://example.test/page", browser=sentinel)
+    streams = await discovery.discover_page(
+        "https://example.test/page",
+        browser=sentinel,
+        client=object(),
+    )
+
+    assert order == ["http-start", "http-done", "browser-start"]
     assert streams == {
-        "https://example.test/http.m3u8",
-        "https://example.test/browser.m3u8",
+        "https://example.test/static.m3u8",
+        "https://example.test/dynamic.m3u8",
     }
 
 
 @pytest.mark.asyncio
 async def test_browser_target_logs_queue_open_result_and_close(capsys):
-    """Browser visits expose enough stderr progress to diagnose queued or slow targets."""
-
-    class FakeLocator:
-        """Return no iframe children for the synthetic page."""
-
-        async def evaluate_all(self, _script: str) -> list[str]:
-            """Return an empty iframe list."""
-            return []
+    """Browser visits expose enough stderr progress to diagnose queued or slow sources."""
 
     class FakePage:
-        """Provide the Playwright methods used by one synthetic browser target."""
+        """Provide the Playwright methods used by one synthetic source page."""
 
         def on(self, _event: str, _callback) -> None:
             """Accept network listeners without emitting a stream."""
@@ -159,10 +105,6 @@ async def test_browser_target_logs_queue_open_result_and_close(capsys):
         async def wait_for_timeout(self, _milliseconds: int) -> None:
             """Yield control once for deterministic async behavior."""
             await asyncio.sleep(0)
-
-        def locator(self, _selector: str) -> FakeLocator:
-            """Return the synthetic iframe locator."""
-            return FakeLocator()
 
         async def close(self) -> None:
             """Simulate closing the browser tab."""
@@ -181,28 +123,21 @@ async def test_browser_target_logs_queue_open_result_and_close(capsys):
     )
     url = "https://example.test/player"
 
-    await discovery._visit_browser_target(session, url, timeout_ms=1_000, settle_ms=0)
+    await discovery._visit_browser_target(session, url, settle_ms=0)
 
     stderr = capsys.readouterr().err
-    assert f"[browser] queued {url}" in stderr
-    assert f"[browser] open {url}" in stderr
-    assert f"[browser] done {url}: 0 HLS, 0 iframe(s)" in stderr
-    assert f"[browser] closed {url}" in stderr
+    assert f"queued {url}" in stderr
+    assert f"open {url}" in stderr
+    assert "done in" in stderr
+    assert f"closed {url}" in stderr
 
 
 @pytest.mark.asyncio
 async def test_browser_targets_share_one_context_and_respect_page_limit():
-    """Browser targets reuse one context and never exceed the configured active-tab limit."""
+    """Source pages reuse one context and never exceed the configured active-tab limit."""
     active_pages = 0
     max_active_pages = 0
     total_pages = 0
-
-    class FakeLocator:
-        """Return no child iframes for the synthetic browser page."""
-
-        async def evaluate_all(self, _script: str) -> list[str]:
-            """Return an empty iframe list."""
-            return []
 
     class FakePage:
         """Model one browser tab while tracking active-tab accounting."""
@@ -218,10 +153,6 @@ async def test_browser_targets_share_one_context_and_respect_page_limit():
         async def wait_for_timeout(self, _milliseconds: int) -> None:
             """Yield control without adding test latency."""
             await asyncio.sleep(0)
-
-        def locator(self, _selector: str) -> FakeLocator:
-            """Return the fake iframe locator."""
-            return FakeLocator()
 
         async def close(self) -> None:
             """Mark this synthetic tab as closed."""
@@ -249,7 +180,6 @@ async def test_browser_targets_share_one_context_and_respect_page_limit():
             discovery._visit_browser_target(
                 session,
                 f"https://example.test/{index}",
-                timeout_ms=1_000,
                 settle_ms=0,
             )
             for index in range(6)

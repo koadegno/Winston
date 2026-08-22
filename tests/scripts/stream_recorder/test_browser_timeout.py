@@ -1,24 +1,18 @@
-"""Regression tests for bounded Playwright target execution."""
+"""Regression tests for bounded Playwright source-page execution."""
 
 import asyncio
 import time
 
 import pytest
 
+from scripts.stream_recorder import discovery
 from scripts.stream_recorder.discovery import BrowserSession, _visit_browser_target
 
 
 @pytest.mark.asyncio
 async def test_browser_target_hard_deadline_releases_slot() -> None:
-    """A wedged browser navigation must stop and release its global tab slot."""
+    """A wedged browser navigation must stop, close its page, and release its tab slot."""
     closed = asyncio.Event()
-
-    class Locator:
-        """Return no iframes for the synthetic page."""
-
-        async def evaluate_all(self, _script: str) -> list[str]:
-            """Return an empty iframe list."""
-            return []
 
     class Page:
         """Model a page whose navigation never completes."""
@@ -35,12 +29,8 @@ async def test_browser_target_hard_deadline_releases_slot() -> None:
             """Yield without adding artificial latency."""
             await asyncio.sleep(0)
 
-        def locator(self, _selector: str) -> Locator:
-            """Return the synthetic iframe locator."""
-            return Locator()
-
         async def close(self) -> None:
-            """Record that timed-out page cleanup ran."""
+            """Record that timed-out page cleanup completed."""
             closed.set()
 
     class Context:
@@ -68,15 +58,8 @@ async def test_browser_target_hard_deadline_releases_slot() -> None:
 
 
 @pytest.mark.asyncio
-async def test_browser_page_close_is_bounded_after_visit() -> None:
-    """A page whose close call wedges must still release the global browser slot."""
-
-    class Locator:
-        """Return no iframes for the synthetic page."""
-
-        async def evaluate_all(self, _script: str) -> list[str]:
-            """Return an empty iframe list."""
-            return []
+async def test_unconfirmed_page_close_poison_browser_instead_of_reusing_slot() -> None:
+    """A wedged page close must make an unrecoverable synthetic session fail closed."""
 
     class Page:
         """Model a successful page whose close call never completes."""
@@ -93,34 +76,59 @@ async def test_browser_page_close_is_bounded_after_visit() -> None:
             """Yield without adding artificial latency."""
             await asyncio.sleep(0)
 
-        def locator(self, _selector: str) -> Locator:
-            """Return the synthetic iframe locator."""
-            return Locator()
-
         async def close(self) -> None:
-            """Block forever to model a stuck browser cleanup call."""
+            """Block forever to model a stuck renderer cleanup call."""
             await asyncio.Event().wait()
 
     class Context:
-        """Create the synthetic page with a wedged close call."""
+        """Create the page and support bounded context cleanup."""
 
         async def new_page(self) -> Page:
             """Return one synthetic page."""
             return Page()
 
+        async def close(self) -> None:
+            """Close the synthetic context immediately."""
+            return None
+
     session = BrowserSession(context=Context(), page_semaphore=asyncio.Semaphore(1))
     started = time.monotonic()
 
-    streams, iframes = await _visit_browser_target(
-        session,
-        "https://example.test/close-wedged",
-        timeout_ms=1_000,
-        settle_ms=0,
-        hard_timeout_ms=100,
-        close_timeout_seconds=0.05,
-    )
+    with pytest.raises(RuntimeError, match="browser recycle failed"):
+        await _visit_browser_target(
+            session,
+            "https://example.test/close-wedged",
+            timeout_ms=1_000,
+            settle_ms=0,
+            hard_timeout_ms=100,
+            close_timeout_seconds=0.05,
+        )
 
-    assert streams == set()
-    assert iframes == set()
     assert time.monotonic() - started < 0.25
+    assert session.failed is not None
     assert session.page_semaphore._value == 1
+
+
+@pytest.mark.asyncio
+async def test_browser_shutdown_is_internally_bounded(monkeypatch) -> None:
+    """Shared browser shutdown must finish under its own deadline when resources wedge."""
+
+    class StuckResource:
+        """Model a Playwright resource whose close call never returns."""
+
+        async def close(self) -> None:
+            """Block forever until the production cleanup deadline cancels this call."""
+            await asyncio.Event().wait()
+
+    monkeypatch.setattr(discovery, "DEFAULT_BROWSER_SHUTDOWN_TIMEOUT_SECONDS", 0.03)
+    session = BrowserSession(
+        context=StuckResource(),
+        browser=StuckResource(),
+        page_semaphore=asyncio.Semaphore(1),
+    )
+    started = time.monotonic()
+
+    await session.shutdown()
+
+    assert time.monotonic() - started < 0.15
+    assert session.failed == "browser shutdown did not complete cleanly"

@@ -6,6 +6,11 @@ on:
       - feat/public-stream-recorder
     paths:
       - '.github/workflows/stream-recorder-full-discovery.yml'
+      - 'scripts/stream_recorder/**'
+      - 'tests/scripts/stream_recorder/**'
+      - 'Place_Overview.xlsb'
+      - 'pyproject.toml'
+      - 'uv.lock'
   pull_request:
     branches:
       - main
@@ -18,10 +23,14 @@ on:
       - 'uv.lock'
   workflow_dispatch:
 
+concurrency:
+  group: stream-recorder-full-discovery-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   full-discovery:
     runs-on: ubuntu-latest
-    timeout-minutes: 350
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
@@ -50,11 +59,14 @@ jobs:
         run: |
           set -euo pipefail
 
-          timeout 340m python -m scripts.stream_recorder.main discover \
+          started=$(date +%s)
+          timeout 10m python -m scripts.stream_recorder.main discover \
             --xlsb Place_Overview.xlsb \
-            --browser-concurrency 2 \
+            --browser-concurrency 4 \
             > /tmp/full-discovery.json \
             2> >(tee /tmp/full-discovery.log >&2)
+          finished=$(date +%s)
+          echo "full_discovery_seconds=$((finished - started))"
 
       - name: Validate complete discovery result
         shell: bash
@@ -64,6 +76,7 @@ jobs:
           python - <<'PY'
           import json
           from pathlib import Path
+          from urllib.parse import urlparse
 
           payload = json.loads(Path('/tmp/full-discovery.json').read_text())
           assert isinstance(payload, list), type(payload)
@@ -71,15 +84,40 @@ jobs:
 
           errors = [item for item in payload if item.get('error')]
           with_candidates = [item for item in payload if item.get('candidates')]
-          candidate_count = sum(len(item.get('candidates', [])) for item in payload)
+          candidate_urls = [
+              url
+              for item in payload
+              for url in item.get('candidates', [])
+          ]
           camera_count = sum(len(item.get('cameras', [])) for item in payload)
+          blocked_suffixes = (
+              'facebook.com',
+              'fbcdn.net',
+              'google.com',
+              'googleapis.com',
+              'google-analytics.com',
+              'googleadservices.com',
+              'googlesyndication.com',
+              'googletagmanager.com',
+              'gstatic.com',
+              'doubleclick.net',
+              'youtube.com',
+              'youtu.be',
+              'googlevideo.com',
+          )
 
-          assert with_candidates, 'The full workbook run completed but discovered no HLS candidates at all'
+          def blocked(url: str) -> bool:
+              host = (urlparse(url).hostname or '').lower()
+              return any(host == suffix or host.endswith('.' + suffix) for suffix in blocked_suffixes)
+
+          blocked_urls = [url for url in candidate_urls if blocked(url)]
+          assert with_candidates, 'The full workbook run discovered no HLS candidates'
+          assert not blocked_urls, f'Blocked service URLs leaked into HLS candidates: {blocked_urls}'
 
           print(f'sources_total={len(payload)}')
           print(f'sources_with_candidates={len(with_candidates)}')
           print(f'sources_with_errors={len(errors)}')
-          print(f'hls_candidates_total={candidate_count}')
+          print(f'hls_candidates_total={len(candidate_urls)}')
           print(f'logical_cameras_total={camera_count}')
 
           if errors:

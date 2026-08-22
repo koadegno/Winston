@@ -1,5 +1,6 @@
 import asyncio
 import json
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 import pytest
@@ -9,8 +10,8 @@ from scripts.stream_recorder.main import main
 from scripts.stream_recorder.sources import Source
 
 
-def test_browser_concurrency_defaults_to_two_and_is_configurable():
-    """CLI browser concurrency is conservative by default and can be overridden."""
+def test_browser_concurrency_defaults_to_four_and_is_configurable():
+    """CLI browser concurrency balances throughput/RAM by default and remains configurable."""
     parser = main_module.build_parser()
 
     default_args = parser.parse_args(["discover", "--url", "https://example.test"])
@@ -19,7 +20,7 @@ def test_browser_concurrency_defaults_to_two_and_is_configurable():
         "--url",
         "https://example.test",
         "--browser-concurrency",
-        "3",
+        "2",
     ])
     record_args = parser.parse_args([
         "record",
@@ -29,8 +30,8 @@ def test_browser_concurrency_defaults_to_two_and_is_configurable():
         "1",
     ])
 
-    assert default_args.browser_concurrency == 2
-    assert explicit_args.browser_concurrency == 3
+    assert default_args.browser_concurrency == 4
+    assert explicit_args.browser_concurrency == 2
     assert record_args.browser_concurrency == 1
 
 
@@ -79,33 +80,59 @@ async def test_candidates_only_skips_hls_resolution(monkeypatch, capsys):
 
 
 @pytest.mark.asyncio
-async def test_xlsb_sources_discover_concurrently_and_report_progress(monkeypatch, tmp_path: Path, capsys):
-    """Every XLSB source task starts concurrently and emits bounded-browser progress."""
+async def test_xlsb_finishes_all_http_before_starting_browser(monkeypatch, tmp_path: Path):
+    """Workbook discovery has a real stage boundary: all HTTP completes before Playwright starts."""
     sources = [
         Source("1", "A", "City", "Country", "https://example.test/a"),
         Source("2", "B", "City", "Country", "https://example.test/b"),
+        Source("3", "C", "City", "Country", "https://example.test/c"),
     ]
-    both_started = asyncio.Event()
-    started: set[str] = set()
+    http_finished: set[str] = set()
+    browser_started: list[str] = []
     monkeypatch.setattr(main_module, "load_sources", lambda _path: sources)
 
-    async def fake_discover_url(url: str, **_kwargs):
-        """Block each source until both source tasks have started."""
-        started.add(url)
-        if len(started) == len(sources):
-            both_started.set()
-        await asyncio.wait_for(both_started.wait(), timeout=0.1)
-        return {"url": url, "candidates": [f"{url}/stream.m3u8"], "cameras": []}
+    class Client:
+        """Stand in for the shared async HTTP client."""
 
-    monkeypatch.setattr(main_module, "discover_url", fake_discover_url)
+    @asynccontextmanager
+    async def fake_http_session():
+        """Yield one shared synthetic client for the complete workbook run."""
+        yield Client()
+
+    @asynccontextmanager
+    async def fake_browser_session(**_kwargs):
+        """Yield one shared synthetic browser session."""
+        yield object()
+
+    async def fake_http(index, source, *, client):
+        """Record HTTP completion after yielding to all peer HTTP tasks."""
+        assert isinstance(client, Client)
+        await asyncio.sleep(0.01)
+        http_finished.add(source.id)
+        return index, {f"{source.url}/static.m3u8"}, None
+
+    async def fake_browser(index, source, *, browser):
+        """Assert every HTTP source finished before any browser source starts."""
+        assert browser is not None
+        assert http_finished == {"1", "2", "3"}
+        browser_started.append(source.id)
+        return index, {f"{source.url}/dynamic.m3u8"}
+
+    monkeypatch.setattr(main_module, "http_session", fake_http_session)
+    monkeypatch.setattr(main_module, "browser_session", fake_browser_session)
+    monkeypatch.setattr(main_module, "_discover_http_source", fake_http)
+    monkeypatch.setattr(main_module, "_discover_browser_source", fake_browser)
+
     results = await main_module._discover_xlsb(
         tmp_path / "places.xlsb",
-        use_browser_fallback=False,
+        use_browser=True,
         resolve=False,
+        browser_concurrency=2,
     )
-    captured = capsys.readouterr()
-    assert [result["source"]["id"] for result in results] == ["1", "2"]
-    assert "scheduling 2 sources; max 2 active browser tab(s)" in captured.err
+
+    assert set(browser_started) == {"1", "2", "3"}
+    assert [result["source"]["id"] for result in results] == ["1", "2", "3"]
+    assert all(len(result["candidates"]) == 2 for result in results)
 
 
 @pytest.mark.asyncio
@@ -116,13 +143,13 @@ async def test_xlsb_candidates_only_passes_resolve_false(monkeypatch, tmp_path: 
     async def fake_discover_xlsb(
         _path,
         *,
-        use_browser_fallback: bool,
+        use_browser: bool,
         resolve: bool,
         browser_concurrency: int,
     ):
         """Capture the discovery options passed by the CLI."""
         observed["resolve"] = resolve
-        observed["browser"] = use_browser_fallback
+        observed["browser"] = use_browser
         observed["browser_concurrency"] = browser_concurrency
         return []
 
@@ -154,6 +181,14 @@ async def test_record_sources_start_concurrently(monkeypatch, tmp_path: Path):
     both_started = asyncio.Event()
     started: set[str] = set()
 
+    class Client:
+        """Stand in for the shared recorder HTTP client."""
+
+    @asynccontextmanager
+    async def fake_http_session():
+        """Yield one shared synthetic HTTP client."""
+        yield Client()
+
     async def fake_record(source, _output, **_kwargs):
         """Block each source recorder until both have started."""
         started.add(source.id)
@@ -161,6 +196,7 @@ async def test_record_sources_start_concurrently(monkeypatch, tmp_path: Path):
             both_started.set()
         await asyncio.wait_for(both_started.wait(), timeout=0.1)
 
+    monkeypatch.setattr(main_module, "http_session", fake_http_session)
     monkeypatch.setattr(main_module, "record_source_forever", fake_record)
     await main_module._record_sources(sources, tmp_path, use_browser=False)
     assert started == {"1", "2"}

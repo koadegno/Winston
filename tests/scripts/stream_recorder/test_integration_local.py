@@ -55,7 +55,7 @@ async def test_discovers_master_and_selects_best_variant():
     """Local end-to-end discovery selects the highest-resolution master variant."""
     with server() as port:
         source = Source("1", "Square", "City", "Country", f"http://127.0.0.1:{port}/page")
-        cameras = await discover_source_cameras(source, use_browser_fallback=False)
+        cameras = await discover_source_cameras(source, use_browser=False)
     assert len(cameras) == 1
     assert cameras[0].stream.resolution == (1920, 1080)
     assert cameras[0].stream.url.endswith("/high.m3u8")
