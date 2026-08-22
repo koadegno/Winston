@@ -8,12 +8,12 @@ from typing import Self
 
 import numpy as np
 from numpy.typing import NDArray
-from pydantic import BaseModel, ConfigDict, field_validator, model_serializer, model_validator
+from pydantic import BaseModel, ConfigDict, Field, computed_field, field_validator, model_validator
 
 from winston.embeddings.models import EmbeddingIdentity
 from winston.ingest.models import MediaType
 from winston.sampling.regions import RegionKind
-from winston.utils.canonical import JsonValue, timestamp_to_microseconds
+from winston.utils.canonical import timestamp_to_microseconds
 
 type VisualVector = NDArray[np.float32]
 
@@ -78,8 +78,32 @@ class IndexedVisual(BaseModel):
     timestamp_seconds: float | None
     region_kind: RegionKind
     region: RegionGeometry
-    vector: VisualVector
-    embedding_identity: EmbeddingIdentity
+    vector: VisualVector = Field(exclude=True)
+    embedding_identity: EmbeddingIdentity = Field(exclude=True)
+
+    @computed_field
+    @property
+    def timestamp_us(self) -> int | None:
+        """Return the canonical integer timestamp persisted in Qdrant payloads."""
+        return timestamp_to_microseconds(self.timestamp_seconds)
+
+    @computed_field
+    @property
+    def model_id(self) -> str:
+        """Expose the embedding model identity directly in serialized payloads."""
+        return self.embedding_identity.model_id
+
+    @computed_field
+    @property
+    def dimension(self) -> int:
+        """Expose the embedding dimension directly in serialized payloads."""
+        return self.embedding_identity.dimension
+
+    @computed_field
+    @property
+    def preprocessing_version(self) -> int:
+        """Expose preprocessing identity directly in serialized payloads."""
+        return self.embedding_identity.preprocessing_version
 
     @field_validator("asset_id")
     @classmethod
@@ -126,30 +150,6 @@ class IndexedVisual(BaseModel):
         self._validate_region()
         self._validate_vector()
         return self
-
-    @model_serializer(mode="plain")
-    def serialize_payload(self) -> dict[str, JsonValue]:
-        """Serialize directly to Winston's complete raw-media-free Qdrant payload."""
-        region: dict[str, JsonValue] = {
-            "x": self.region.x,
-            "y": self.region.y,
-            "width": self.region.width,
-            "height": self.region.height,
-            "scale": self.region.scale,
-        }
-        return {
-            "asset_id": self.asset_id,
-            "source_path": self.source_path,
-            "media_type": self.media_type.value,
-            "sample_kind": self.sample_kind.value,
-            "timestamp_seconds": self.timestamp_seconds,
-            "timestamp_us": timestamp_to_microseconds(self.timestamp_seconds),
-            "region_kind": self.region_kind.value,
-            "region": region,
-            "model_id": self.embedding_identity.model_id,
-            "dimension": self.embedding_identity.dimension,
-            "preprocessing_version": self.embedding_identity.preprocessing_version,
-        }
 
     def _validate_sample(self) -> None:
         """Validate media/sample-kind pairing and temporal provenance."""
