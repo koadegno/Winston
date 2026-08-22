@@ -6,13 +6,13 @@ on:
       - feat/public-stream-recorder
     paths:
       - '.github/workflows/stream-recorder-full-discovery.yml'
-      - 'Place_Overview.xlsb'
   pull_request:
     branches:
       - main
     paths:
       - '.github/workflows/stream-recorder-full-discovery.yml'
       - 'scripts/stream_recorder/**'
+      - 'tests/scripts/stream_recorder/**'
       - 'Place_Overview.xlsb'
       - 'pyproject.toml'
       - 'uv.lock'
@@ -21,7 +21,7 @@ on:
 jobs:
   full-discovery:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 350
     steps:
       - uses: actions/checkout@v4
 
@@ -31,6 +31,9 @@ jobs:
 
       - name: Install project and script dependencies
         run: python -m pip install -e '.[script]'
+
+      - name: Run stream recorder regression tests
+        run: python -m pytest tests/scripts/stream_recorder -q
 
       - name: Install Chromium
         run: python -m playwright install --with-deps chromium
@@ -47,7 +50,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          timeout 75m python -m scripts.stream_recorder.main discover \
+          timeout 340m python -m scripts.stream_recorder.main discover \
             --xlsb Place_Overview.xlsb \
             --browser-concurrency 2 \
             > /tmp/full-discovery.json \
