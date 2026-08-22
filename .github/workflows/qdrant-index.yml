@@ -3,16 +3,18 @@ name: Qdrant visual index
 on:
   pull_request:
     paths:
+      - 'src/winston/cli.py'
+      - 'src/winston/config.py'
       - 'src/winston/index/**'
       - 'src/winston/indexing/**'
       - 'src/winston/ingest/identity.py'
       - 'src/winston/sampling/**'
-      - 'src/winston/config.py'
+      - 'tests/src/winston/test_cli.py'
+      - 'tests/src/winston/test_config.py'
       - 'tests/src/winston/index/**'
       - 'tests/src/winston/indexing/**'
       - 'tests/src/winston/ingest/test_identity.py'
       - 'tests/src/winston/sampling/test_images.py'
-      - 'tests/src/winston/test_config.py'
       - 'tests/integration/test_qdrant_visual_index.py'
       - 'pyproject.toml'
       - 'uv.lock'
@@ -66,6 +68,7 @@ jobs:
       - name: Run Phase 1E focused unit tests
         run: >-
           python -m pytest -q
+          tests/src/winston/test_cli.py
           tests/src/winston/test_config.py
           tests/src/winston/ingest/test_identity.py
           tests/src/winston/sampling/test_images.py
