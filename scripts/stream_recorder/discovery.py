@@ -25,6 +25,7 @@ DEFAULT_HTTP_CONNECTIONS = 32
 DEFAULT_HTTP_TIMEOUT_SECONDS = 10.0
 DEFAULT_HTTP_TOTAL_TIMEOUT_SECONDS = 12.0
 _BROWSER_STREAM_GRACE_MS = 750
+_MEDIA_ACTIVATION_GRACE_MS = 1_500
 _MAX_HLS_URL_TOKEN_LENGTH = 4096
 _HLS_MARKER = ".m3u8"
 _LEFT_URL_BOUNDARIES = frozenset(" \t\r\n'\"<>`()[]{},;=")
@@ -43,6 +44,14 @@ _BLOCKED_STREAM_HOST_SUFFIXES = (
     "youtube.com",
     "youtu.be",
     "googlevideo.com",
+)
+_PLAY_CONTROL_SELECTORS = (
+    "button.vjs-big-play-button",
+    ".vjs-big-play-button",
+    ".plyr__control--overlaid",
+    "button[aria-label*='play' i]",
+    "button[title*='play' i]",
+    "video",
 )
 
 _T = TypeVar("_T")
@@ -383,6 +392,92 @@ async def _close_page_bounded(
     return closed
 
 
+async def _activate_video_elements(page: Any, prefix: str, deadline: float) -> bool:
+    """Attempt programmatic playback of videos in the existing source frame tree."""
+    attempted = False
+    for index, frame in enumerate(page.frames):
+        try:
+            videos = frame.locator("video")
+            count = await _await_bounded(
+                videos.count(),
+                timeout_seconds=min(1.0, _remaining_seconds(deadline)),
+                operation=f"video count frame {index}",
+            )
+            if not count:
+                continue
+            attempted = True
+            await _await_bounded(
+                videos.evaluate_all(
+                    """elements => Promise.allSettled(elements.map(async video => {
+                        video.muted = true;
+                        video.playsInline = true;
+                        await video.play();
+                    }))"""
+                ),
+                timeout_seconds=min(1.5, _remaining_seconds(deadline)),
+                operation=f"video play frame {index}",
+            )
+            frame_url = getattr(frame, "url", "unknown")
+            log(f"{prefix} media activation: play() on {count} video(s) frame={frame_url}")
+        except Exception as exc:
+            # Cross-origin frames are still represented by Playwright Frame objects, but a broken
+            # player must never abort discovery of the rest of the source page.
+            log(f"{prefix} media activation warning frame={index}: {type(exc).__name__}: {exc}")
+    return attempted
+
+
+async def _click_play_controls(page: Any, prefix: str, deadline: float) -> bool:
+    """Click one visible play control per frame when programmatic playback emitted no HLS."""
+    clicked = False
+    for frame_index, frame in enumerate(page.frames):
+        for selector in _PLAY_CONTROL_SELECTORS:
+            try:
+                locator = frame.locator(selector).first
+                count = await _await_bounded(
+                    locator.count(),
+                    timeout_seconds=min(0.5, _remaining_seconds(deadline)),
+                    operation=f"play control count frame {frame_index}",
+                )
+                if not count:
+                    continue
+                visible = await _await_bounded(
+                    locator.is_visible(),
+                    timeout_seconds=min(0.5, _remaining_seconds(deadline)),
+                    operation=f"play control visibility frame {frame_index}",
+                )
+                if not visible:
+                    continue
+                await _await_bounded(
+                    locator.click(timeout=1_000, force=True),
+                    timeout_seconds=min(1.5, _remaining_seconds(deadline)),
+                    operation=f"play control click frame {frame_index}",
+                )
+                frame_url = getattr(frame, "url", "unknown")
+                log(
+                    f"{prefix} media activation: clicked {selector!r} "
+                    f"frame={frame_url}"
+                )
+                clicked = True
+                break
+            except Exception:
+                # Selectors are best-effort across many unrelated third-party player libraries.
+                continue
+    return clicked
+
+
+async def _wait_for_hls_after_activation(
+    stream_seen: asyncio.Event,
+    *,
+    deadline: float,
+) -> None:
+    """Wait briefly for a media activation to produce an HLS request."""
+    wait_seconds = min(_MEDIA_ACTIVATION_GRACE_MS / 1000, _remaining_seconds(deadline))
+    try:
+        await asyncio.wait_for(stream_seen.wait(), timeout=wait_seconds)
+    except TimeoutError:
+        return
+
+
 async def _visit_browser_target(
     session: BrowserSession,
     url: str,
@@ -479,7 +574,17 @@ async def _visit_browser_target(
                             )
                         )
 
-            # Ensure the settle window itself did not consume the last fraction of the deadline.
+            if not streams:
+                log(f"{prefix} no HLS after initial load; trying media activation")
+                attempted = await _activate_video_elements(page, prefix, deadline)
+                if attempted and not streams:
+                    await _wait_for_hls_after_activation(stream_seen, deadline=deadline)
+                if not streams:
+                    clicked = await _click_play_controls(page, prefix, deadline)
+                    if clicked and not streams:
+                        await _wait_for_hls_after_activation(stream_seen, deadline=deadline)
+
+            # Ensure the settle/activation window itself did not consume the deadline.
             _remaining_seconds(deadline)
             elapsed = time.monotonic() - started
             log(f"{prefix} done in {elapsed:.1f}s: {len(streams)} HLS candidate(s)")
