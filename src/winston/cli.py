@@ -2,9 +2,11 @@
 
 import argparse
 import asyncio
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
+import logging
 from pathlib import Path
 import sys
-from typing import Sequence
 
 from winston.config import Settings, get_config
 from winston.indexing.models import IndexRunResult
@@ -12,6 +14,8 @@ from winston.indexing.pipeline import run_indexing
 from winston.ingest.models import ImageMetadata, VideoMetadata
 from winston.ingest.probe import probe_media
 from winston.ingest.scanner import scan_media
+
+PROGRESS_LOGGER = logging.getLogger("winston.progress")
 
 
 def _format_duration(seconds: float) -> str:
@@ -21,6 +25,24 @@ def _format_duration(seconds: float) -> str:
     minutes, remainder = divmod(remainder, 60_000)
     secs, milliseconds = divmod(remainder, 1000)
     return f"{hours:02d}:{minutes:02d}:{secs:02d}.{milliseconds:03d}"
+
+
+@contextmanager
+def _index_progress_logging() -> Iterator[None]:
+    """Surface Winston INFO progress on stderr without enabling third-party INFO loggers."""
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    previous_level = PROGRESS_LOGGER.level
+    previous_propagate = PROGRESS_LOGGER.propagate
+    PROGRESS_LOGGER.addHandler(handler)
+    PROGRESS_LOGGER.setLevel(logging.INFO)
+    PROGRESS_LOGGER.propagate = False
+    try:
+        yield
+    finally:
+        PROGRESS_LOGGER.removeHandler(handler)
+        PROGRESS_LOGGER.setLevel(previous_level)
+        PROGRESS_LOGGER.propagate = previous_propagate
 
 
 def _print_metadata(metadata: VideoMetadata | ImageMetadata, root: Path) -> None:
@@ -62,14 +84,16 @@ def _print_index_result(result: IndexRunResult) -> None:
 
 def index_command(root: Path, settings: Settings) -> int:
     """Run restartable asynchronous indexing and map the result to a shell exit status."""
-    try:
-        resolved_root = root.resolve(strict=True)
-        if not resolved_root.is_dir():
-            raise ValueError(f"indexing root is not a directory: {resolved_root}")
-        result = asyncio.run(run_indexing(resolved_root, settings))
-    except Exception as exc:
-        print(f"Indexing failed: {exc}", file=sys.stderr)
-        return 1
+    with _index_progress_logging():
+        try:
+            resolved_root = root.resolve(strict=True)
+            if not resolved_root.is_dir():
+                raise ValueError(f"indexing root is not a directory: {resolved_root}")
+            PROGRESS_LOGGER.info("Winston index: %s", resolved_root)
+            result = asyncio.run(run_indexing(resolved_root, settings))
+        except Exception as exc:
+            print(f"Indexing failed: {exc}", file=sys.stderr)
+            return 1
 
     _print_index_result(result)
     return result.exit_code
