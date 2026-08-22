@@ -51,6 +51,6 @@ jobs:
           echo 'Qdrant did not become ready on port 6333' >&2
           exit 1
       - name: Run full locked Winston regression
-        run: uv run pytest -q
+        run: uv run python -m pytest -q
       - name: Compile Winston source and tests
         run: uv run python -m compileall -q src tests
