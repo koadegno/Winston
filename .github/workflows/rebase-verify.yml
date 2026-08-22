@@ -12,6 +12,17 @@ on:
       - scripts/stream_recorder/**
       - tests/scripts/stream_recorder/**
       - .github/workflows/rebase-verify.yml
+  pull_request:
+    branches:
+      - main
+    paths:
+      - pyproject.toml
+      - uv.lock
+      - src/winston/**
+      - tests/src/winston/**
+      - scripts/stream_recorder/**
+      - tests/scripts/stream_recorder/**
+      - .github/workflows/rebase-verify.yml
 
 permissions:
   contents: write
@@ -47,6 +58,7 @@ jobs:
         run: uv run python -m compileall -q src/winston scripts/stream_recorder
 
       - name: Commit lock and verification marker
+        if: github.event_name == 'push'
         run: |
           printf '%s\n' 'result=success' 'tests=tests/src/winston + tests/scripts/stream_recorder' 'compileall=success' > .rebase-verify-success
           git config user.name 'github-actions[bot]'
