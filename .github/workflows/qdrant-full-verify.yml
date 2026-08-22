@@ -1,0 +1,47 @@
+name: Qdrant full verification
+
+on:
+  pull_request:
+    branches:
+      - feat/qdrant-visual-index
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      qdrant:
+        image: qdrant/qdrant:v1.18.2
+        ports:
+          - 6333:6333
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+      - name: Verify lockfile
+        run: uv lock --check
+      - name: Sync full locked environment
+        run: uv sync --locked
+      - name: Wait for Qdrant
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attempt in {1..30}; do
+            if curl --fail --silent http://localhost:6333/collections >/dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          exit 1
+      - name: Run full Winston regression suite
+        run: uv run python -m pytest -q tests/src/winston
+      - name: Run real Qdrant integration tests
+        run: uv run python -m pytest -q tests/integration/test_qdrant_visual_index.py
+      - name: Compile Winston source
+        run: uv run python -m compileall -q src/winston
