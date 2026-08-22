@@ -1,0 +1,3 @@
+result=success
+tests=tests/src/winston + tests/scripts/stream_recorder
+compileall=success
