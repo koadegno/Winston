@@ -2,6 +2,7 @@
 
 from collections.abc import AsyncGenerator
 from itertools import batched
+import logging
 from pathlib import Path
 
 from winston.config import Settings
@@ -21,6 +22,17 @@ from winston.sampling.base import FrameSampler
 from winston.sampling.images import ImageSamplingError, load_image
 from winston.sampling.keyframes import FrameSamplingError, KeyframeSampler
 from winston.sampling.regions import generate_regions
+
+PROGRESS_LOGGER = logging.getLogger("winston.progress")
+
+
+def _format_timestamp(seconds: float) -> str:
+    """Format one keyframe timestamp as HH:MM:SS.mmm for progress output."""
+    total_milliseconds = round(seconds * 1000)
+    hours, remainder = divmod(total_milliseconds, 3_600_000)
+    minutes, remainder = divmod(remainder, 60_000)
+    secs, milliseconds = divmod(remainder, 1000)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}.{milliseconds:03d}"
 
 
 class IndexingPipeline:
@@ -51,7 +63,9 @@ class IndexingPipeline:
 
     async def run(self) -> IndexRunResult:
         """Index every discovered asset sequentially and retain actionable per-asset failures."""
+        PROGRESS_LOGGER.info("Preparing dataset identity...")
         dataset = load_or_create_dataset_identity(self._root)
+        PROGRESS_LOGGER.info("Preparing visual index...")
         session = await self._visual_index.ensure_compatible(
             self._embedder.identity,
             dataset.dataset_instance_id,
@@ -59,12 +73,14 @@ class IndexingPipeline:
         manifest = IndexManifest(self._root)
         completed = manifest.completed_asset_ids(session.index_instance_id)
         media_files = scan_media(self._root)
+        media_count = len(media_files)
+        PROGRESS_LOGGER.info("Found %d media files", media_count)
 
         indexed = 0
         skipped = 0
         failures: list[AssetFailure] = []
 
-        for media in media_files:
+        for position, media in enumerate(media_files, start=1):
             self._stage = PipelineStage.IDENTITY
             failure_path = self._display_path(media.path)
             identity: AssetIdentity | None = None
@@ -73,9 +89,22 @@ class IndexingPipeline:
                 failure_path = identity.source_path
                 if identity.asset_id in completed:
                     skipped += 1
+                    PROGRESS_LOGGER.info(
+                        "[%d/%d] SKIP %s - already indexed",
+                        position,
+                        media_count,
+                        identity.source_path,
+                    )
                     continue
 
-                await self._process_media(media=media, identity=identity)
+                PROGRESS_LOGGER.info(
+                    "[%d/%d] %s %s",
+                    position,
+                    media_count,
+                    media.media_type.value.upper(),
+                    identity.source_path,
+                )
+                vector_count = await self._process_media(media=media, identity=identity)
 
                 self._stage = PipelineStage.MANIFEST
                 manifest.mark_completed(
@@ -86,6 +115,7 @@ class IndexingPipeline:
                 # Keep the in-memory view current so duplicate discovery in one process is harmless too.
                 completed.add(identity.asset_id)
                 indexed += 1
+                PROGRESS_LOGGER.info("      Completed: %d vectors", vector_count)
             except (
                 OSError,
                 ValueError,
@@ -96,13 +126,22 @@ class IndexingPipeline:
                 VisualIndexError,
                 ManifestError,
             ) as exc:
+                message = str(exc) or exc.__class__.__name__
                 failures.append(
                     AssetFailure(
                         source_path=failure_path,
                         stage=self._stage,
-                        message=str(exc) or exc.__class__.__name__,
+                        message=message,
                         cause=exc,
                     )
+                )
+                PROGRESS_LOGGER.error(
+                    "[%d/%d] FAILED %s [%s]: %s",
+                    position,
+                    media_count,
+                    failure_path,
+                    self._stage.value,
+                    message,
                 )
 
         return IndexRunResult(
@@ -111,20 +150,23 @@ class IndexingPipeline:
             failures=tuple(failures),
         )
 
-    async def _process_media(self, *, media: MediaFile, identity: AssetIdentity) -> None:
+    async def _process_media(self, *, media: MediaFile, identity: AssetIdentity) -> int:
         """Delete stale revisions then route one current asset through its media-specific sampler."""
         self._stage = PipelineStage.DELETE
+        PROGRESS_LOGGER.info("      Removing stale revisions...")
         await self._visual_index.delete_old_revisions(
             source_path=identity.source_path,
             current_asset_id=identity.asset_id,
         )
 
         self._stage = PipelineStage.PROBE
+        PROGRESS_LOGGER.info("      Probing media...")
         metadata = probe_media(media)
         if isinstance(metadata, ImageMetadata):
             self._stage = PipelineStage.DECODE
+            PROGRESS_LOGGER.info("      Decoding image...")
             sample = load_image(metadata)
-            await self._index_sample(
+            return await self._index_sample(
                 identity=identity,
                 media_type=MediaType.IMAGE,
                 sample_kind=SampleKind.IMAGE,
@@ -133,11 +175,9 @@ class IndexingPipeline:
                 height=sample.height,
                 rgb24=sample.rgb24,
             )
-            return
 
         if isinstance(metadata, VideoMetadata):
-            await self._index_video(identity=identity, metadata=metadata)
-            return
+            return await self._index_video(identity=identity, metadata=metadata)
 
         raise TypeError(f"unsupported probed media metadata: {type(metadata).__name__}")
 
@@ -146,10 +186,13 @@ class IndexingPipeline:
         *,
         identity: AssetIdentity,
         metadata: VideoMetadata,
-    ) -> None:
-        """Stream one video's keyframes and close its sampler promptly on downstream failure."""
+    ) -> int:
+        """Stream one video's keyframes, report progress, and return persisted vector count."""
+        PROGRESS_LOGGER.info("      Sampling keyframes...")
         frames = self._frame_sampler.sample(metadata)
         primary: BaseException | None = None
+        frame_number = 0
+        vector_count = 0
         try:
             while True:
                 # Reset this before each anext(): after a prior frame upsert, a later decoder failure
@@ -160,7 +203,13 @@ class IndexingPipeline:
                 except StopAsyncIteration:
                     break
 
-                await self._index_sample(
+                frame_number += 1
+                PROGRESS_LOGGER.info(
+                    "      Keyframe %d @ %s",
+                    frame_number,
+                    _format_timestamp(frame.timestamp_seconds),
+                )
+                vector_count += await self._index_sample(
                     identity=identity,
                     media_type=MediaType.VIDEO,
                     sample_kind=SampleKind.KEYFRAME,
@@ -169,6 +218,7 @@ class IndexingPipeline:
                     height=frame.height,
                     rgb24=frame.rgb24,
                 )
+            return vector_count
         except BaseException as exc:
             primary = exc
             raise
@@ -192,21 +242,23 @@ class IndexingPipeline:
         width: int,
         height: int,
         rgb24: bytes,
-    ) -> None:
+    ) -> int:
         """Generate, embed, and persist one photo or keyframe with bounded buffering."""
         region_batches = batched(
             generate_regions(width=width, height=height, rgb24=rgb24),
             int(self._settings.indexing.visual_batch_size),
         )
+        vector_count = 0
 
         while True:
             self._stage = PipelineStage.REGIONS
             try:
                 regions = next(region_batches)
             except StopIteration:
-                return
+                return vector_count
 
             self._stage = PipelineStage.EMBEDDING
+            PROGRESS_LOGGER.info("        Embedding %d regions...", len(regions))
             embedded = await self._embedder.embed_images(regions)
             if embedded.count != len(regions):
                 raise ValueError(
@@ -240,7 +292,9 @@ class IndexingPipeline:
             )
 
             self._stage = PipelineStage.UPSERT
+            PROGRESS_LOGGER.info("        Upserting %d vectors...", len(visuals))
             await self._visual_index.upsert(visuals)
+            vector_count += len(visuals)
 
     def _display_path(self, media_path: Path) -> str:
         """Return a stable relative path even when identity computation fails later."""
@@ -270,6 +324,12 @@ async def _close_dependencies(
 async def run_indexing(root: Path, settings: Settings) -> IndexRunResult:
     """Build one reusable indexing stack, execute it, and close resources without masking failures."""
     embedder = create_embedder(settings)
+    PROGRESS_LOGGER.info("Embedding model: %s", embedder.identity.model_id)
+    PROGRESS_LOGGER.info(
+        "Qdrant: %s / %s",
+        settings.qdrant.url,
+        settings.qdrant.collection,
+    )
     try:
         visual_index: VisualIndex = QdrantVisualIndex(settings.qdrant)
     except BaseException as primary:
