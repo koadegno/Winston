@@ -81,11 +81,14 @@ jobs:
 
           payload = json.loads(Path('/tmp/full-discovery.json').read_text())
           assert isinstance(payload, list), type(payload)
-          assert len(payload) == 34, f'Expected 34 enabled non-YouTube sources, got {len(payload)}'
+          assert len(payload) == 36, f'Expected 36 enabled non-YouTube sources, got {len(payload)}'
 
           by_id = {str((item.get('source') or {}).get('id')): item for item in payload}
           assert '61' not in by_id, 'Sittard must stay disabled while its player is YouTube-backed'
-          for source_id in ('90-1', '90-2', '90-3', '90-4', '90-5', '90-6', '131', '132', '133'):
+          for source_id in (
+              '90-1', '90-2', '90-3', '90-4', '90-5', '90-6',
+              '131', '132', '133', '134', '135',
+          ):
               assert source_id in by_id, f'Missing configured source {source_id}'
 
           errors = [item for item in payload if item.get('error')]
@@ -140,7 +143,10 @@ jobs:
           print(f'logical_cameras_total={camera_count}')
 
           print('New source coverage:')
-          for source_id in ('90-1', '90-2', '90-3', '90-4', '90-5', '90-6', '131', '132', '133'):
+          for source_id in (
+              '90-1', '90-2', '90-3', '90-4', '90-5', '90-6',
+              '131', '132', '133', '134', '135',
+          ):
               item = by_id[source_id]
               print(
                   f"- {source_id}: candidates={len(item.get('candidates', []))} "
