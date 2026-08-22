@@ -199,6 +199,33 @@ async def test_real_browser_session_uses_isolated_context_per_source() -> None:
 
 
 @pytest.mark.asyncio
+async def test_browser_retries_one_clean_empty_visit_in_fresh_source_context(monkeypatch) -> None:
+    """An intermittent player that cleanly emits no HLS gets exactly one bounded fresh retry."""
+    stream_url = "https://hd-auth.skylinewebcams.com/live.m3u8?a=fresh"
+    calls = 0
+
+    async def fake_visit(*_args, **_kwargs) -> set[str]:
+        """Miss HLS once, then model a fresh isolated source session succeeding."""
+        nonlocal calls
+        calls += 1
+        return set() if calls == 1 else {stream_url}
+
+    monkeypatch.setattr(discovery, "_visit_browser_target", fake_visit)
+    session = discovery.BrowserSession(
+        context=object(),
+        page_semaphore=asyncio.Semaphore(1),
+    )
+
+    streams = await discovery.discover_browser(
+        "https://example.test/intermittent-player",
+        browser=session,
+    )
+
+    assert calls == 2
+    assert streams == {stream_url}
+
+
+@pytest.mark.asyncio
 async def test_concurrent_camera_rediscovery_is_coalesced_per_source(monkeypatch) -> None:
     """Camera failures from one source must await one shared in-flight rediscovery."""
     source = Source("1", "Square", "City", "Country", "https://example.test/page")
