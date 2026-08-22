@@ -64,15 +64,23 @@ async def discover_url(
                 client=client,
             )
 
+    browser_observed_urls: set[str] = set()
     candidates = await discover_page(
         url,
         use_browser=use_browser,
         browser=browser,
         browser_concurrency=browser_concurrency,
         client=client,
+        browser_observed_urls=browser_observed_urls,
     )
     cameras = (
-        assign_camera_ids(await resolve_cameras(candidates, client=client))
+        assign_camera_ids(
+            await resolve_cameras(
+                candidates,
+                client=client,
+                browser_observed_urls=browser_observed_urls,
+            )
+        )
         if resolve
         else []
     )
@@ -127,11 +135,18 @@ async def _discover_browser_source(
 async def _resolve_source(
     index: int,
     candidates: set[str],
+    browser_observed_urls: set[str],
     *,
     client: Any,
 ) -> tuple[int, list[dict[str, object]]]:
     """Resolve one source's HLS candidates into deterministic camera dictionaries."""
-    cameras = assign_camera_ids(await resolve_cameras(candidates, client=client))
+    cameras = assign_camera_ids(
+        await resolve_cameras(
+            candidates,
+            client=client,
+            browser_observed_urls=browser_observed_urls,
+        )
+    )
     return index, [
         {
             "camera_id": camera.id,
@@ -160,6 +175,7 @@ async def _discover_xlsb(
         return []
 
     candidates_by_source: list[set[str]] = [set() for _ in sources]
+    browser_observed_by_source: list[set[str]] = [set() for _ in sources]
     errors_by_source: list[BaseException | None] = [None for _ in sources]
     cameras_by_source: list[list[dict[str, object]]] = [[] for _ in sources]
 
@@ -191,8 +207,8 @@ async def _discover_xlsb(
                 if browser is None:
                     raise RuntimeError("browser session unexpectedly disabled")
 
-                # Every source is visited exactly once in Playwright, even after an HTTP hit,
-                # because a page can expose additional cameras only through dynamic frame traffic.
+                # Every source is visited in Playwright even after an HTTP hit because dynamic
+                # frame traffic can expose additional cameras absent from static page content.
                 browser_tasks = [
                     asyncio.create_task(
                         _discover_browser_source(index, source, browser=browser)
@@ -202,6 +218,7 @@ async def _discover_xlsb(
                 for completed in asyncio.as_completed(browser_tasks):
                     index, streams = await completed
                     candidates_by_source[index].update(streams)
+                    browser_observed_by_source[index].update(streams)
                     source = sources[index]
                     log(
                         f"[discover] BROWSER source {source.id} DONE {source.place}: "
@@ -215,7 +232,12 @@ async def _discover_xlsb(
             log("[discover] STAGE 3/3 HLS resolve start")
             resolve_tasks = [
                 asyncio.create_task(
-                    _resolve_source(index, candidates, client=client)
+                    _resolve_source(
+                        index,
+                        candidates,
+                        browser_observed_by_source[index],
+                        client=client,
+                    )
                 )
                 for index, candidates in enumerate(candidates_by_source)
                 if candidates
