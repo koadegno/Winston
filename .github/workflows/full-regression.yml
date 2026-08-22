@@ -1,0 +1,56 @@
+name: Full Winston regression
+
+on:
+  pull_request:
+    paths:
+      - 'src/**'
+      - 'scripts/**'
+      - 'tests/**'
+      - 'pyproject.toml'
+      - 'uv.lock'
+      - '.github/workflows/full-regression.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      qdrant:
+        image: qdrant/qdrant:v1.18.2
+        ports:
+          - 6333:6333
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+      - name: Verify lockfile
+        run: uv lock --check
+      - name: Install locked project dependencies
+        run: uv sync --locked --all-extras
+      - name: Install FFmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+      - name: Wait for Qdrant 1.18.2
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attempt in {1..30}; do
+            if curl --fail --silent http://localhost:6333/collections >/dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          echo 'Qdrant did not become ready on port 6333' >&2
+          exit 1
+      - name: Run full locked Winston regression
+        run: uv run pytest -q
+      - name: Compile Winston source and tests
+        run: uv run python -m compileall -q src tests
