@@ -102,53 +102,92 @@ async def test_browser_target_siblings_start_concurrently():
 
 
 @pytest.mark.asyncio
-async def test_browser_is_skipped_when_http_already_finds_hls(monkeypatch):
-    """Direct HTML HLS discovery must avoid consuming a Playwright tab."""
-    calls: list[str] = []
+async def test_http_and_browser_layers_run_concurrently(monkeypatch):
+    """Direct HTTP and browser observation both run so dynamic cameras are not missed."""
+    both_started = asyncio.Event()
+    started: set[str] = set()
     sentinel = object()
-    stream_url = "https://example.test/direct.m3u8"
+
+    async def wait_for_peer(name: str, result: set[str]) -> set[str]:
+        """Wait until both independent discovery layers have entered."""
+        started.add(name)
+        if len(started) == 2:
+            both_started.set()
+        await asyncio.wait_for(both_started.wait(), timeout=0.1)
+        return result
 
     async def fake_http(_url: str) -> set[str]:
-        """Return a stream directly from the HTML source."""
-        calls.append("http")
-        return {stream_url}
+        """Simulate the direct HTTP layer."""
+        return await wait_for_peer("http", {"https://example.test/http.m3u8"})
 
     async def fake_browser(_url: str, *, browser) -> set[str]:
-        """Record any unnecessary browser fallback invocation."""
+        """Simulate the browser network-observation layer."""
         assert browser is sentinel
-        calls.append("browser")
-        return {"https://example.test/browser.m3u8"}
+        return await wait_for_peer("browser", {"https://example.test/browser.m3u8"})
 
     monkeypatch.setattr(discovery, "discover_http", fake_http)
     monkeypatch.setattr(discovery, "discover_browser", fake_browser)
-
-    assert await discovery.discover_page("https://example.test/page", browser=sentinel) == {stream_url}
-    assert calls == ["http"]
+    streams = await discovery.discover_page("https://example.test/page", browser=sentinel)
+    assert streams == {
+        "https://example.test/http.m3u8",
+        "https://example.test/browser.m3u8",
+    }
 
 
 @pytest.mark.asyncio
-async def test_browser_runs_after_http_miss(monkeypatch):
-    """Playwright remains available as the fallback when direct HTML has no HLS."""
-    sentinel = object()
-    browser_stream = "https://example.test/browser.m3u8"
-    calls: list[str] = []
+async def test_browser_target_logs_queue_open_result_and_close(capsys):
+    """Browser visits expose enough stderr progress to diagnose queued or slow targets."""
 
-    async def fake_http(_url: str) -> set[str]:
-        """Simulate a source page without an HLS URL in its HTML."""
-        calls.append("http")
-        return set()
+    class FakeLocator:
+        """Return no iframe children for the synthetic page."""
 
-    async def fake_browser(_url: str, *, browser) -> set[str]:
-        """Return the HLS URL found from browser network traffic."""
-        assert browser is sentinel
-        calls.append("browser")
-        return {browser_stream}
+        async def evaluate_all(self, _script: str) -> list[str]:
+            """Return an empty iframe list."""
+            return []
 
-    monkeypatch.setattr(discovery, "discover_http", fake_http)
-    monkeypatch.setattr(discovery, "discover_browser", fake_browser)
+    class FakePage:
+        """Provide the Playwright methods used by one synthetic browser target."""
 
-    assert await discovery.discover_page("https://example.test/page", browser=sentinel) == {browser_stream}
-    assert calls == ["http", "browser"]
+        def on(self, _event: str, _callback) -> None:
+            """Accept network listeners without emitting a stream."""
+            return None
+
+        async def goto(self, _url: str, **_kwargs) -> None:
+            """Simulate an immediately loaded page."""
+            return None
+
+        async def wait_for_timeout(self, _milliseconds: int) -> None:
+            """Yield control once for deterministic async behavior."""
+            await asyncio.sleep(0)
+
+        def locator(self, _selector: str) -> FakeLocator:
+            """Return the synthetic iframe locator."""
+            return FakeLocator()
+
+        async def close(self) -> None:
+            """Simulate closing the browser tab."""
+            return None
+
+    class FakeContext:
+        """Create one synthetic page from the shared context."""
+
+        async def new_page(self) -> FakePage:
+            """Return a new synthetic browser page."""
+            return FakePage()
+
+    session = discovery.BrowserSession(
+        context=FakeContext(),
+        page_semaphore=asyncio.Semaphore(1),
+    )
+    url = "https://example.test/player"
+
+    await discovery._visit_browser_target(session, url, timeout_ms=1_000, settle_ms=0)
+
+    stderr = capsys.readouterr().err
+    assert f"[browser] queued {url}" in stderr
+    assert f"[browser] open {url}" in stderr
+    assert f"[browser] done {url}: 0 HLS, 0 iframe(s)" in stderr
+    assert f"[browser] closed {url}" in stderr
 
 
 @pytest.mark.asyncio
@@ -200,9 +239,10 @@ async def test_browser_targets_share_one_context_and_respect_page_limit():
             max_active_pages = max(max_active_pages, active_pages)
             return FakePage()
 
-    session_type = getattr(discovery, "BrowserSession", None)
-    assert session_type is not None, "bounded shared BrowserSession is not implemented"
-    session = session_type(context=FakeContext(), page_semaphore=asyncio.Semaphore(2))
+    session = discovery.BrowserSession(
+        context=FakeContext(),
+        page_semaphore=asyncio.Semaphore(2),
+    )
 
     await asyncio.gather(
         *(
