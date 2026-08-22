@@ -1,6 +1,6 @@
 # Public stream recorder
 
-One-shot dataset collection tooling for Winston. It discovers public HLS webcam streams and records them into UTC hour-aligned MKV files.
+One-shot dataset collection tooling for Winston. It discovers public HLS webcam streams and records them into restart-safe MKV slices that never cross UTC hour boundaries.
 
 YouTube and YouTube Live are intentionally unsupported.
 
@@ -150,7 +150,11 @@ datasets/recordings/
     └── cameras/
         └── camera-001/
             ├── camera.json
-            └── YYYY/MM/DD/YYYY-MM-DDTHH-00-00Z.mkv
+            └── YYYY/MM/DD/
+                ├── YYYY-MM-DDTHH-00-00Z__start-HH-MM-SS-ffffffZ.mkv
+                └── YYYY-MM-DDTHH-00-00Z__start-HH-MM-SS-ffffffZ.mkv
 ```
 
-The first file after startup may be shorter than one hour so that subsequent files align with real UTC clock hours.
+Each FFmpeg attempt writes a new immutable slice. A retry, stream rediscovery, or process restart during the same UTC hour therefore creates another file instead of overwriting video that was already collected. FFmpeg is also started in no-overwrite mode so an unexpected filename collision fails safely.
+
+The first slice after startup may be shorter than one hour, and retries can produce several slices for the same hour. No slice intentionally crosses the next UTC hour boundary. On task cancellation, the recorder sends FFmpeg `SIGINT` first so it can finalize the current MKV before the Python task exits; an unresponsive process is killed only after a bounded grace period.
