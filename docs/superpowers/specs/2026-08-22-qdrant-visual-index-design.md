@@ -82,9 +82,9 @@ class VisualIndex(Protocol):
     async def close(self) -> None: ...
 ```
 
-`ensure_compatible()` establishes or validates the collection before indexing begins.
+`ensure_compatible()` establishes or validates the collection before indexing begins and records the compatible `EmbeddingIdentity` for the index session.
 
-`upsert()` accepts Winston value types and performs bounded, idempotent writes.
+`upsert()` accepts Winston value types and performs bounded, idempotent writes. It requires a successful `ensure_compatible()` first. Every visual in the batch must use the same embedding identity that was validated for the session; otherwise the call fails before writing anything. An empty batch is a no-op.
 
 `close()` releases the reusable Qdrant client.
 
@@ -220,13 +220,19 @@ The algorithm resolves both paths, verifies the source is inside the indexing ro
 
 Consequences:
 
-- moving an otherwise unchanged Winston dataset from one absolute machine path to another does not change IDs;
+- moving an otherwise unchanged Winston dataset from one absolute machine path to another does not change IDs when the relative path and file metadata are preserved;
 - Windows and POSIX path separators do not create different identities;
 - a source outside the indexing root is rejected instead of receiving an ambiguous identity.
 
 ### Canonical asset representation
 
-The input is serialized canonically rather than concatenated ambiguously. Conceptually:
+The identity name is versioned with the prefix:
+
+```text
+winston:asset:v1:
+```
+
+followed by canonical JSON. Conceptually:
 
 ```json
 {
@@ -236,7 +242,7 @@ The input is serialized canonically rather than concatenated ambiguously. Concep
 }
 ```
 
-The representation uses fixed JSON separators and sorted keys before SHA-256 hashing.
+The JSON representation uses UTF-8, sorted keys, fixed separators `(',', ':')`, and no insignificant whitespace. SHA-256 hashes the complete `winston:asset:v1:` prefix plus canonical JSON bytes.
 
 The resulting `asset_id` is a lowercase hexadecimal SHA-256 string.
 
@@ -268,7 +274,14 @@ embedding_identity:
     preprocessing_version
 ```
 
-The model validates enough invariants to prevent malformed points from crossing the Winston/Qdrant boundary, including vector dimension consistency with `embedding_identity`.
+The model validates enough invariants to prevent malformed points from crossing the Winston/Qdrant boundary, including:
+
+- non-empty `asset_id` and relative `source_path`;
+- valid media/sample-kind combinations (`image/image`, `video/keyframe`);
+- `timestamp_seconds is None` for photos and a finite non-negative timestamp for video keyframes;
+- positive region dimensions and non-negative coordinates;
+- `full` regions use `x=0`, `y=0`, `scale=1.0`;
+- the vector is one-dimensional `float32` and has exactly `embedding_identity.dimension` elements.
 
 `sample_kind` is represented by a Winston enum rather than a free-form string.
 
@@ -280,9 +293,9 @@ Qdrant payloads keep human-friendly seconds:
 timestamp_seconds = 123.456
 ```
 
-Deterministic identity never depends on the string representation of a float.
+Deterministic identity never depends on the string representation of a binary float.
 
-For identity purposes Winston converts timestamps to integer microseconds:
+For identity purposes, Winston converts the finite non-negative timestamp to decimal using `Decimal(str(timestamp_seconds))`, multiplies by `1_000_000`, and rounds to the nearest integer microsecond with `ROUND_HALF_UP`.
 
 ```text
 123.456 seconds
@@ -316,7 +329,7 @@ The UUID name begins with a versioned Winston prefix:
 winston:visual:v1:
 ```
 
-and is followed by a canonical sorted JSON representation containing:
+and is followed by canonical UTF-8 JSON using sorted keys and fixed separators `(',', ':')` containing:
 
 ```text
 asset_id
@@ -406,6 +419,8 @@ visual -> float[768]
 
 `QdrantVisualIndex.upsert()` maps `IndexedVisual` values to Qdrant `PointStruct` values using deterministic UUIDv5 IDs.
 
+Before constructing any Qdrant points, the whole supplied batch is checked against the embedding identity previously accepted by `ensure_compatible()`. A mixed or incompatible batch fails before the first network write.
+
 Qdrant upsert semantics replace a point with the same ID, so repeated indexing of an unchanged candidate does not create duplicates.
 
 The write path is:
@@ -413,7 +428,9 @@ The write path is:
 ```text
 IndexedVisual[]
       ↓
-validate / map
+validate complete batch identity
+      ↓
+map one bounded chunk
       ↓
 sequential chunks of at most 256 points
       ↓
@@ -434,7 +451,7 @@ Writes are sequential in V0. No extra Qdrant write concurrency is introduced unt
 
 The index layer must not build a second unbounded copy of an indexing job.
 
-It accepts a bounded sequence from the caller and maps/writes at most one configured Qdrant batch at a time. The default of 256 keeps one raw 768-dimensional float32 vector batch to roughly 0.75 MiB before Python/Qdrant object overhead.
+It accepts a bounded sequence from the caller and materializes Qdrant point objects for at most one configured write chunk at a time. The default of 256 corresponds to roughly 0.75 MiB of raw data for 256 vectors of 768 `float32` values before Python/Qdrant object overhead.
 
 No raw image bytes are retained or sent to Qdrant by this layer.
 
@@ -448,7 +465,7 @@ VisualIndexError
 └── IncompatibleVisualIndexError
 ```
 
-`VisualIndexConfigurationError` covers invalid Winston-side index configuration or malformed index inputs.
+`VisualIndexConfigurationError` covers invalid Winston-side index configuration, malformed index inputs, calling `upsert()` before compatibility has been established, or trying to upsert a batch with an embedding identity different from the active collection identity.
 
 `IncompatibleVisualIndexError` covers an already-existing Qdrant collection whose vector configuration or Winston metadata does not match the requested embedding identity.
 
@@ -467,7 +484,9 @@ Network and provider failures from Qdrant should retain their original exception
 
 The collection contract remains `Cosine` because that is the semantic metric used by Phase 1C and the roadmap.
 
-Qdrant documents that cosine vectors are normalized on upload and similarity calculation is then implemented as a dot product over normalized vectors. Winston therefore does not need to replace the collection contract with `Dot` merely to obtain dot-product execution internally.
+Qdrant documents that cosine vectors are automatically normalized during upload and similarity calculation is implemented as a dot product over normalized vectors. Winston therefore does not need to replace the collection contract with `Dot` merely to obtain dot-product execution internally.
+
+Because Qdrant may return the normalized stored vector rather than the exact raw provider vector, Phase 1D integration tests verify identity, point count, vector configuration, and payload provenance rather than asserting byte-for-byte equality with the pre-upload embedding.
 
 The persisted metric remains explicitly `cosine` in Winston collection metadata.
 
@@ -495,15 +514,19 @@ Required unit coverage includes:
 - changing exact region geometry changes the point ID;
 - changing model, dimension, or preprocessing version changes the point ID;
 - `scale` does not change the point ID when exact pixel geometry is unchanged;
-- timestamps are converted deterministically to integer microseconds;
+- timestamps use the specified deterministic microsecond conversion;
 - photo, keyframe, full-frame, and tile payloads preserve complete provenance;
+- invalid media/sample/timestamp combinations are rejected;
 - vector dimension mismatches are rejected before Qdrant upsert;
+- `upsert()` before `ensure_compatible()` is rejected;
+- a mixed embedding-identity batch is rejected before any network write;
 - collection creation uses the configured named vector, dimension, and Cosine metric;
 - collection metadata is written on creation;
 - missing or incompatible existing collection metadata is rejected;
 - incompatible actual vector configuration is rejected even if metadata claims compatibility;
 - the implementation never calls an automatic collection deletion path;
 - upserts are split into batches no larger than the configured batch size;
+- only one write batch is materialized at a time;
 - `wait=True` is used;
 - repeated logical candidates map to the same Qdrant point ID.
 
@@ -572,10 +595,11 @@ The future search layer can later depend on a search-capable index contract with
 The design deliberately fixes these V0 choices:
 
 - SHA-256 asset identity from canonical relative path + file size + `mtime_ns`;
+- versioned canonical asset identity material (`winston:asset:v1`);
 - source paths relative to the indexing root;
 - UUIDv5 Qdrant point IDs using `uuid.NAMESPACE_URL`;
-- versioned canonical JSON as UUID name material;
-- microsecond integer timestamp identity;
+- versioned canonical JSON as UUID name material (`winston:visual:v1`);
+- deterministic integer microsecond timestamp identity using decimal `ROUND_HALF_UP`;
 - exact pixel geometry, not region scale, as spatial point identity;
 - named vector `visual`;
 - 768 dimensions for Jina CLIP v1;
@@ -583,6 +607,8 @@ The design deliberately fixes these V0 choices:
 - native Qdrant collection metadata for Winston index compatibility;
 - strict refusal of unowned/incompatible existing collections;
 - no automatic drop/recreate behavior;
+- explicit compatibility establishment before upsert;
+- no mixed embedding identities within an upsert session;
 - `AsyncQdrantClient` reused for the index lifetime;
 - sequential upsert batches, default size 256;
 - `wait=True` for completed write semantics;
