@@ -9,10 +9,23 @@ from pathlib import Path
 import sys
 from typing import Any, Sequence
 
-from .discovery import browser_session, discover_page
+from .discovery import (
+    DEFAULT_BROWSER_CONCURRENCY,
+    BrowserSession,
+    browser_session,
+    discover_page,
+)
 from .hls import resolve_cameras
 from .orchestrator import assign_camera_ids, record_source_forever
 from .sources import Source, load_sources
+
+
+def _positive_int(value: str) -> int:
+    """Parse a strictly positive integer for bounded concurrency arguments."""
+    parsed = int(value)
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return parsed
 
 
 async def discover_url(
@@ -20,13 +33,15 @@ async def discover_url(
     *,
     use_browser_fallback: bool = True,
     resolve: bool = True,
-    browser: Any | None = None,
+    browser: BrowserSession | None = None,
+    browser_concurrency: int = DEFAULT_BROWSER_CONCURRENCY,
 ) -> dict[str, object]:
     """Discover HLS candidates and optionally resolve logical cameras for one URL."""
     candidates = await discover_page(
         url,
         use_browser_fallback=use_browser_fallback,
         browser=browser,
+        browser_concurrency=browser_concurrency,
     )
     cameras = assign_camera_ids(await resolve_cameras(candidates)) if resolve else []
     return {
@@ -50,7 +65,8 @@ async def _discover_one_source(
     *,
     use_browser_fallback: bool,
     resolve: bool,
-    browser: Any | None,
+    browser: BrowserSession | None,
+    browser_concurrency: int,
 ) -> tuple[int, dict[str, object]]:
     """Discover one XLSB source and capture failures as structured output."""
     try:
@@ -59,6 +75,7 @@ async def _discover_one_source(
             use_browser_fallback=use_browser_fallback,
             resolve=resolve,
             browser=browser,
+            browser_concurrency=browser_concurrency,
         )
         result["source"] = source.to_dict()
         result["error"] = None
@@ -78,11 +95,15 @@ async def _discover_xlsb(
     *,
     use_browser_fallback: bool,
     resolve: bool,
+    browser_concurrency: int = DEFAULT_BROWSER_CONCURRENCY,
 ) -> list[dict[str, object]]:
-    """Discover every XLSB source concurrently while reporting live progress."""
+    """Schedule every XLSB source concurrently with bounded browser resource use."""
     sources = load_sources(path)
     print(
-        f"[discover] starting {len(sources)} sources in parallel",
+        (
+            f"[discover] scheduling {len(sources)} sources; "
+            f"max {browser_concurrency} active browser tab(s)"
+        ),
         file=sys.stderr,
         flush=True,
     )
@@ -90,8 +111,11 @@ async def _discover_xlsb(
         return []
 
     ordered_results: list[dict[str, object] | None] = [None] * len(sources)
-    async with browser_session(enabled=use_browser_fallback) as browser:
-        # One Chromium process is shared; every source/player gets its own isolated context.
+    async with browser_session(
+        enabled=use_browser_fallback,
+        max_pages=browser_concurrency,
+    ) as browser:
+        # All sources are async tasks, but browser work queues behind one global semaphore.
         tasks = [
             asyncio.create_task(
                 _discover_one_source(
@@ -100,6 +124,7 @@ async def _discover_xlsb(
                     use_browser_fallback=use_browser_fallback,
                     resolve=resolve,
                     browser=browser,
+                    browser_concurrency=browser_concurrency,
                 )
             )
             for index, source in enumerate(sources)
@@ -122,7 +147,7 @@ async def _record_one_source(
     source: Source,
     output_root: Path,
     *,
-    browser: Any | None,
+    browser: BrowserSession | None,
 ) -> None:
     """Run one source recorder without allowing its failure to stop other sources."""
     try:
@@ -140,24 +165,45 @@ async def _record_sources(
     output_root: Path,
     *,
     use_browser: bool = True,
+    browser_concurrency: int = DEFAULT_BROWSER_CONCURRENCY,
 ) -> None:
-    """Start every selected source recorder concurrently with a shared browser."""
+    """Start all source recorders while bounding concurrent Playwright tabs."""
     if not sources:
         raise RuntimeError("No non-YouTube sources found")
 
     print(
-        f"[record] starting {len(sources)} sources in parallel",
+        (
+            f"[record] scheduling {len(sources)} sources; "
+            f"max {browser_concurrency} active browser tab(s)"
+        ),
         file=sys.stderr,
         flush=True,
     )
-    async with browser_session(enabled=use_browser) as browser:
-        # Source recorders are independent long-lived tasks and must start together.
+    async with browser_session(
+        enabled=use_browser,
+        max_pages=browser_concurrency,
+    ) as browser:
+        # Recorders are independent; only their browser discovery work is rate-limited.
         await asyncio.gather(
             *(
                 _record_one_source(source, output_root, browser=browser)
                 for source in sources
             )
         )
+
+
+def _add_browser_concurrency_argument(parser: argparse.ArgumentParser) -> None:
+    """Add the shared Playwright tab-limit option to a subcommand parser."""
+    parser.add_argument(
+        "--browser-concurrency",
+        type=_positive_int,
+        default=DEFAULT_BROWSER_CONCURRENCY,
+        metavar="N",
+        help=(
+            "Maximum number of Playwright tabs active at once across all sources "
+            f"(default: {DEFAULT_BROWSER_CONCURRENCY})."
+        ),
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -184,6 +230,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Only discover .m3u8 URLs; do not fetch/resolve the HLS playlists.",
     )
+    _add_browser_concurrency_argument(discover)
 
     record = subparsers.add_parser(
         "record",
@@ -201,6 +248,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=[],
         help="Optional source id filter; repeatable.",
     )
+    _add_browser_concurrency_argument(record)
     return parser
 
 
@@ -216,12 +264,14 @@ async def main(argv: Sequence[str] | None = None) -> int:
                 args.url,
                 use_browser_fallback=use_browser,
                 resolve=resolve,
+                browser_concurrency=args.browser_concurrency,
             )
         else:
             payload = await _discover_xlsb(
                 args.xlsb,
                 use_browser_fallback=use_browser,
                 resolve=resolve,
+                browser_concurrency=args.browser_concurrency,
             )
         print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
         return 0
@@ -230,7 +280,11 @@ async def main(argv: Sequence[str] | None = None) -> int:
     if args.source_id:
         selected = set(args.source_id)
         sources = [source for source in sources if source.id in selected]
-    await _record_sources(sources, args.output)
+    await _record_sources(
+        sources,
+        args.output,
+        browser_concurrency=args.browser_concurrency,
+    )
     return 0
 
 
