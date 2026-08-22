@@ -1,10 +1,12 @@
 import numpy as np
+from pydantic import JsonValue as PydanticJsonValue
 
 from winston.embeddings.models import EmbeddingIdentity
 from winston.index.identity import timestamp_to_microseconds, visual_point_id
 from winston.index.models import IndexedVisual, RegionGeometry, SampleKind
 from winston.ingest.models import MediaType
 from winston.sampling.regions import RegionKind
+from winston.utils import canonical
 
 ASSET_ID = "b" * 64
 IDENTITY = EmbeddingIdentity("jinaai/jina-clip-v1", 768, 1)
@@ -30,6 +32,11 @@ def make_visual(
         vector=np.ones(embedding_identity.dimension, dtype=np.float32),
         embedding_identity=embedding_identity,
     )
+
+
+def test_canonical_json_uses_pydantic_json_value_alias() -> None:
+    """Canonical JSON typing should reuse Pydantic's standard JSON value alias."""
+    assert canonical.JsonValue is PydanticJsonValue
 
 
 def test_timestamp_to_microseconds_uses_half_up_rounding() -> None:
