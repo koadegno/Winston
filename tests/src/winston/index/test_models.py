@@ -39,7 +39,7 @@ def make_visual(**overrides: object) -> IndexedVisual:
 
 
 def make_image_visual(**overrides: object) -> IndexedVisual:
-    """Build one valid still-image full-frame visual and apply test overrides."""
+    """Build one valid still-image full-frame visual and apply explicit test overrides."""
     values: dict[str, object] = {
         "asset_id": ASSET_ID,
         "source_path": "photos/front-door.jpg",
@@ -119,8 +119,16 @@ def test_indexed_visual_rejects_invalid_asset_id() -> None:
 
 
 def test_indexed_visual_rejects_non_portable_source_path() -> None:
-    """Qdrant payload paths must remain relative POSIX paths under the indexing root."""
-    for invalid in ("/absolute/cam.mkv", "../escape.mkv", "cams/../escape.mkv", r"cams\cam.mkv", ""):
+    """Qdrant payload paths must remain normalized relative POSIX paths under the indexing root."""
+    for invalid in (
+        "/absolute/cam.mkv",
+        "../escape.mkv",
+        "cams/../escape.mkv",
+        "cams/./cam.mkv",
+        ".",
+        r"cams\cam.mkv",
+        "",
+    ):
         with pytest.raises(VisualIndexConfigurationError, match="source_path"):
             make_visual(source_path=invalid)
 
