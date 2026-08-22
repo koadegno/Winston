@@ -18,7 +18,9 @@ from .log import log
 DEFAULT_BROWSER_CONCURRENCY = 4
 DEFAULT_BROWSER_NAVIGATION_TIMEOUT_MS = 10_000
 DEFAULT_BROWSER_SETTLE_MS = 4_000
-DEFAULT_BROWSER_TARGET_HARD_TIMEOUT_MS = 15_000
+# Heavy public players can consume the navigation budget before exposing their play control.
+# Keep a separate total budget so interaction and the post-click HLS grace period still run.
+DEFAULT_BROWSER_TARGET_HARD_TIMEOUT_MS = 30_000
 DEFAULT_BROWSER_PAGE_CLOSE_TIMEOUT_SECONDS = 2.0
 DEFAULT_BROWSER_SHUTDOWN_TIMEOUT_SECONDS = 5.0
 DEFAULT_HTTP_CONNECTIONS = 32
