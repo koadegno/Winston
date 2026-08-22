@@ -7,6 +7,7 @@ on:
     paths:
       - 'scripts/stream_recorder/**'
       - 'tests/scripts/stream_recorder/**'
+      - 'Place_Overview.csv'
       - 'pyproject.toml'
       - 'uv.lock'
       - '.github/workflows/stream-recorder.yml'
@@ -14,6 +15,7 @@ on:
     paths:
       - 'scripts/stream_recorder/**'
       - 'tests/scripts/stream_recorder/**'
+      - 'Place_Overview.csv'
       - 'pyproject.toml'
       - 'uv.lock'
       - '.github/workflows/stream-recorder.yml'
@@ -77,87 +79,43 @@ jobs:
           print(f'brussels_m3u8={len(brussels)}')
           print(f'prijedor_ipcamlive_m3u8={len(ipcamlive)}')
           PY
-      - name: Diagnose Sittard Czersk and Debica players
+
+      - name: Verify Czersk media activation and Debica TLS fallback
         shell: bash
         run: |
+          set -euo pipefail
+
+          timeout 90s python -m scripts.stream_recorder.main discover \
+            --url 'https://czersk.pl/strona/552-kamera-line' \
+            --candidates-only \
+            > /tmp/czersk.json &
+          czersk_pid=$!
+
+          timeout 90s python -m scripts.stream_recorder.main discover \
+            --url 'https://www.kamery24.org/i24/index.php/test/82-debica-rynek' \
+            > /tmp/debica.json &
+          debica_pid=$!
+
+          wait "$czersk_pid"
+          wait "$debica_pid"
+
+          cat /tmp/czersk.json
+          cat /tmp/debica.json
+
           python - <<'PY'
-          import asyncio
-          from playwright.async_api import async_playwright
+          import json
+          from pathlib import Path
 
-          targets = [
-              ('sittard', 'https://webcamsittard.nl/index.php/nl/camera1'),
-              ('czersk', 'https://czersk.pl/strona/552-kamera-line'),
-              ('debica', 'https://www.kamery24.org/i24/index.php/test/82-debica-rynek'),
-          ]
-          interesting = ('.m3u8', 'camstreamer', 'stream360', 'kamery24', 'online2.')
+          czersk = json.loads(Path('/tmp/czersk.json').read_text())
+          debica = json.loads(Path('/tmp/debica.json').read_text())
 
-          async def inspect(context, name, url):
-              print(f'===== {name.upper()} =====')
-              page = await context.new_page()
-              requests = []
+          czersk_url = 'https://7005.szczecin.pl/camss/streams/czersk.m3u8'
+          debica_url = 'https://online2.kamery24.org/cam/debica.m3u8'
 
-              def collect(request):
-                  lowered = request.url.lower()
-                  if any(token in lowered for token in interesting):
-                      requests.append(request.url)
-                      print(f'REQUEST {request.resource_type}: {request.url}')
+          assert czersk_url in czersk['candidates'], czersk
+          assert debica_url in debica['candidates'], debica
+          assert debica['cameras'], debica
 
-              page.on('request', collect)
-              try:
-                  await page.goto(url, wait_until='domcontentloaded', timeout=15_000)
-              except Exception as exc:
-                  print(f'GOTO ERROR: {type(exc).__name__}: {exc}')
-              await page.wait_for_timeout(4_000)
-
-              print('FRAMES BEFORE CLICK')
-              for index, frame in enumerate(page.frames):
-                  print(f'FRAME {index}: {frame.url}')
-                  try:
-                      print(f'  videos={await frame.locator("video").count()}')
-                  except Exception as exc:
-                      print(f'  inspect-error={type(exc).__name__}: {exc}')
-
-              try:
-                  iframe_srcs = await page.locator('iframe').evaluate_all(
-                      "els => els.map(e => e.src || e.getAttribute('src'))"
-                  )
-                  print(f'IFRAMES={iframe_srcs}')
-              except Exception as exc:
-                  print(f'IFRAME ERROR: {type(exc).__name__}: {exc}')
-
-              for index, frame in enumerate(page.frames):
-                  for selector in (
-                      'button.vjs-big-play-button',
-                      '.vjs-big-play-button',
-                      "button[aria-label*='Play']",
-                      "button[title*='Play']",
-                      'video',
-                  ):
-                      try:
-                          locator = frame.locator(selector).first
-                          if await locator.count() and await locator.is_visible():
-                              print(f'CLICK frame={index} selector={selector}')
-                              await locator.click(timeout=2_000, force=True)
-                              break
-                      except Exception as exc:
-                          print(f'CLICK ERROR frame={index} selector={selector}: {type(exc).__name__}: {exc}')
-                  await page.wait_for_timeout(1_000)
-
-              await page.wait_for_timeout(4_000)
-              m3u8 = sorted({item for item in requests if '.m3u8' in item.lower()})
-              print(f'M3U8 COUNT={len(m3u8)}')
-              for item in m3u8:
-                  print(f'M3U8 {item}')
-              await page.close()
-
-          async def main():
-              async with async_playwright() as pw:
-                  browser = await pw.chromium.launch(headless=True)
-                  context = await browser.new_context(ignore_https_errors=True)
-                  for name, url in targets:
-                      await inspect(context, name, url)
-                  await context.close()
-                  await browser.close()
-
-          asyncio.run(main())
+          print(f"czersk_m3u8={len(czersk['candidates'])}")
+          print(f"debica_cameras={len(debica['cameras'])}")
           PY
