@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 import re
 import ssl
 from typing import Any
@@ -12,10 +13,20 @@ from urllib.parse import urljoin
 from urllib.request import Request, urlopen
 
 
+DEFAULT_BROWSER_CONCURRENCY = 2
+
 _M3U8_RE = re.compile(
     r"(?P<url>(?:https?:)?(?:\\?/[^\s'\"<>]*)?[^\s'\"<>]*?\.m3u8(?:\?[^\s'\"<>]*)?)",
     re.IGNORECASE,
 )
+
+
+@dataclass(slots=True)
+class BrowserSession:
+    """Share one browser context and bound the number of simultaneously active tabs."""
+
+    context: Any
+    page_semaphore: asyncio.Semaphore
 
 
 def _normalize_escaped_url(value: str) -> str:
@@ -69,7 +80,7 @@ async def crawl_browser_targets(
     *,
     max_iframe_depth: int = 2,
 ) -> set[str]:
-    """Visit browser targets breadth-first while running siblings concurrently."""
+    """Visit browser targets breadth-first while scheduling siblings concurrently."""
     streams: set[str] = set()
     seen: set[str] = set()
     current_level = {root_url}
@@ -80,7 +91,7 @@ async def crawl_browser_targets(
             break
         seen.update(targets)
 
-        # Every independent page/player at the same depth is opened concurrently.
+        # Siblings are scheduled together; BrowserSession applies the global tab limit.
         results = await asyncio.gather(*(visit(target) for target in targets), return_exceptions=True)
         next_level: set[str] = set()
         for result in results:
@@ -108,37 +119,45 @@ async def _iframe_urls(page: Any) -> set[str]:
 
 
 async def _visit_browser_target(
-    browser: Any,
+    session: BrowserSession,
     url: str,
     *,
     timeout_ms: int,
     settle_ms: int,
 ) -> tuple[set[str], set[str]]:
-    """Observe one page/player in an isolated browser context and collect HLS requests."""
+    """Observe one target in a shared context while respecting the global tab limit."""
     streams: set[str] = set()
-    context = await browser.new_context()
-    try:
-        page = await context.new_page()
 
-        def collect(request: Any) -> None:
-            """Capture HLS requests emitted while the target page is running."""
-            if ".m3u8" in request.url.lower():
-                streams.add(request.url)
+    # A renderer can use hundreds of MB. Keep only a small bounded number alive at once.
+    async with session.page_semaphore:
+        page = await session.context.new_page()
+        try:
 
-        page.on("request", collect)
-        await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
-        await page.wait_for_timeout(settle_ms)
-        return streams, await _iframe_urls(page)
-    finally:
-        await context.close()
+            def collect(request: Any) -> None:
+                """Capture HLS requests emitted while the target page is running."""
+                if ".m3u8" in request.url.lower():
+                    streams.add(request.url)
+
+            page.on("request", collect)
+            await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+            await page.wait_for_timeout(settle_ms)
+            return streams, await _iframe_urls(page)
+        finally:
+            await page.close()
 
 
 @asynccontextmanager
-async def browser_session(enabled: bool = True) -> AsyncIterator[Any | None]:
-    """Yield one shared Chromium browser for concurrent source discovery."""
+async def browser_session(
+    enabled: bool = True,
+    *,
+    max_pages: int = DEFAULT_BROWSER_CONCURRENCY,
+) -> AsyncIterator[BrowserSession | None]:
+    """Yield one Chromium/context pair with bounded concurrent tabs."""
     if not enabled:
         yield None
         return
+    if max_pages < 1:
+        raise ValueError("max_pages must be at least 1")
 
     try:
         from playwright.async_api import async_playwright
@@ -147,16 +166,21 @@ async def browser_session(enabled: bool = True) -> AsyncIterator[Any | None]:
 
     async with async_playwright() as playwright:
         browser = await playwright.chromium.launch(headless=True)
+        context = await browser.new_context()
         try:
-            yield browser
+            yield BrowserSession(
+                context=context,
+                page_semaphore=asyncio.Semaphore(max_pages),
+            )
         finally:
+            await context.close()
             await browser.close()
 
 
 async def discover_browser(
     url: str,
     *,
-    browser: Any,
+    browser: BrowserSession,
     timeout_ms: int = 20_000,
     settle_ms: int = 5_000,
     max_iframe_depth: int = 2,
@@ -185,19 +209,23 @@ async def discover_page(
     url: str,
     *,
     use_browser_fallback: bool = True,
-    browser: Any | None = None,
+    browser: BrowserSession | None = None,
+    browser_concurrency: int = DEFAULT_BROWSER_CONCURRENCY,
 ) -> set[str]:
     """Run direct HTTP and browser discovery concurrently for one source page."""
     if use_browser_fallback and browser is None:
-        async with browser_session() as local_browser:
+        async with browser_session(max_pages=browser_concurrency) as local_browser:
             return await discover_page(
                 url,
                 use_browser_fallback=True,
                 browser=local_browser,
+                browser_concurrency=browser_concurrency,
             )
 
     coroutines: list[Awaitable[set[str]]] = [discover_http(url)]
     if use_browser_fallback:
+        if browser is None:
+            raise RuntimeError("browser discovery requires an active browser session")
         coroutines.append(discover_browser(url, browser=browser))
 
     # HTTP source inspection and browser observation are independent I/O paths.
