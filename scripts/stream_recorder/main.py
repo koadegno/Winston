@@ -91,7 +91,7 @@ async def _discover_xlsb(
 
     ordered_results: list[dict[str, object] | None] = [None] * len(sources)
     async with browser_session(enabled=use_browser_fallback) as browser:
-        # One Chromium process is shared; every source/player gets its own isolated context.
+        # One Chromium/context is shared; BrowserSession caps active pages globally.
         tasks = [
             asyncio.create_task(
                 _discover_one_source(
