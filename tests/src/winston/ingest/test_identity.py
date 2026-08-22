@@ -92,3 +92,12 @@ def test_identify_asset_rejects_directory_source(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="source path must reference a file"):
         identify_asset(index_root=root, source_path=source)
+
+
+def test_identify_asset_rejects_file_as_index_root(tmp_path: Path) -> None:
+    """The indexing root must be a directory, never the media file itself."""
+    source = tmp_path / "camera.mkv"
+    source.write_bytes(b"camera-data")
+
+    with pytest.raises(ValueError, match="indexing root must reference a directory"):
+        identify_asset(index_root=source, source_path=source)
