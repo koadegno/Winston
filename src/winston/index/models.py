@@ -110,10 +110,16 @@ def _validate_source_path(source_path: str) -> None:
             "source_path must be a normalized relative POSIX path"
         )
 
-    path = PurePosixPath(source_path)
-    if path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
+    # Inspect the raw components before PurePosixPath can normalize away '.' segments.
+    if any(part in {"", ".", ".."} for part in source_path.split("/")):
         raise VisualIndexConfigurationError(
-            "source_path must be a normalized relative POSIX path without '..'"
+            "source_path must be a normalized relative POSIX path without '.' or '..'"
+        )
+
+    path = PurePosixPath(source_path)
+    if path.is_absolute():
+        raise VisualIndexConfigurationError(
+            "source_path must be a normalized relative POSIX path"
         )
 
 
