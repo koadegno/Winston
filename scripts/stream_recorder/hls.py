@@ -6,7 +6,7 @@ import asyncio
 from dataclasses import dataclass
 import re
 from typing import Any
-from urllib.parse import urljoin
+from urllib.parse import parse_qsl, urlencode, urljoin, urlparse
 
 from .discovery import fetch_text
 from .log import log
@@ -29,6 +29,43 @@ class HlsVariant:
 
 
 _ATTRIBUTE_RE = re.compile(r'([A-Z0-9-]+)=((?:"[^"]*")|[^,]*)')
+_CHUNKLIST_RE = re.compile(r"^chunklist(?:_[^.]+)?\.m3u8$", re.IGNORECASE)
+_OUTPUT_RE = re.compile(r"^(?P<base>.+?)_output_\d+\.m3u8$", re.IGNORECASE)
+_TRACKS_DIR_RE = re.compile(r"^tracks-v\d+$", re.IGNORECASE)
+_UUID_PLAYLIST_RE = re.compile(
+    r"^(?P<uuid>[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.m3u8$",
+    re.IGNORECASE,
+)
+_UUID_IN_PATH_RE = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+    re.IGNORECASE,
+)
+_CDN_MIRROR_PREFIX_RE = re.compile(r"^cdn\d+\.", re.IGNORECASE)
+_GENERIC_PLAYLIST_NAMES = {
+    "index.m3u8",
+    "master.m3u8",
+    "playlist.m3u8",
+    "playlists.m3u8",
+    "stream.m3u8",
+    "chunks.m3u8",
+}
+_EPHEMERAL_QUERY_KEYS = {
+    "auth",
+    "expires",
+    "hdnts",
+    "policy",
+    "schash",
+    "scendtime",
+    "session",
+    "sig",
+    "signature",
+    "token",
+}
+_EPHEMERAL_QUERY_PREFIXES = (
+    "_hls_",
+    "wowzatoken",
+    "x-amz-",
+)
 
 
 def _parse_attributes(line: str) -> dict[str, str]:
@@ -86,6 +123,131 @@ def choose_best_stream(variants: list[HlsVariant]) -> HlsVariant:
     return max(variants, key=lambda item: (item.pixels, item.bandwidth))
 
 
+def _is_ephemeral_query_key(key: str) -> bool:
+    """Return whether a query key represents a short-lived HLS delivery token."""
+    lowered = key.lower()
+    return lowered in _EPHEMERAL_QUERY_KEYS or any(
+        lowered.startswith(prefix) for prefix in _EPHEMERAL_QUERY_PREFIXES
+    )
+
+
+def _stable_query_string(url: str) -> str:
+    """Keep only query parameters that can identify a camera rather than one session."""
+    pairs = [
+        (key, value)
+        for key, value in parse_qsl(urlparse(url).query, keep_blank_values=True)
+        if not _is_ephemeral_query_key(key)
+    ]
+    return urlencode(sorted(pairs))
+
+
+def _normalized_origin(url: str, family_path: str) -> str:
+    """Normalize default ports and equivalent numbered CDN mirror hostnames."""
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+
+    # CDN01/CDN02 style mirrors serve the same stream identity from equivalent hosts.
+    # Only collapse them when the path contains a strong UUID identity to avoid merging
+    # unrelated generic /live/playlist.m3u8 cameras from different servers.
+    if _UUID_IN_PATH_RE.search(family_path):
+        host = _CDN_MIRROR_PREFIX_RE.sub("", host)
+
+    port = parsed.port
+    if port and not (
+        (parsed.scheme.lower() == "https" and port == 443)
+        or (parsed.scheme.lower() == "http" and port == 80)
+    ):
+        host = f"{host}:{port}"
+    return f"{parsed.scheme.lower()}://{host}"
+
+
+def _camera_family_path(url: str) -> str:
+    """Derive a stable path shared by master/media playlists of one physical camera."""
+    path = urlparse(url).path
+    parts = [part for part in path.split("/") if part]
+    if not parts:
+        return "/"
+
+    filename = parts[-1]
+    lowered = filename.lower()
+
+    # Wowza/Nimble-style master and chunklist filenames live in the same stream directory.
+    if _CHUNKLIST_RE.match(filename) or lowered in _GENERIC_PLAYLIST_NAMES:
+        return "/" + "/".join(parts[:-1]) + "/"
+
+    # LL-HLS players commonly expose video1_stream.m3u8 beside index.m3u8.
+    if re.fullmatch(r"video\d*_stream\.m3u8", lowered):
+        return "/" + "/".join(parts[:-1]) + "/"
+
+    # HLS masters can reference tracks-v1/mono.ts.m3u8 below the camera directory.
+    if len(parts) >= 2 and _TRACKS_DIR_RE.match(parts[-2]) and lowered.endswith(".m3u8"):
+        return "/" + "/".join(parts[:-2]) + "/"
+
+    output_match = _OUTPUT_RE.match(filename)
+    if output_match:
+        parts[-1] = output_match.group("base")
+        return "/" + "/".join(parts)
+
+    uuid_match = _UUID_PLAYLIST_RE.match(filename)
+    if uuid_match:
+        parts[-1] = uuid_match.group("uuid")
+        return "/" + "/".join(parts)
+
+    # Preserve arbitrary filenames such as front.m3u8/back.m3u8 so two cameras in the
+    # same directory are never merged merely because they share a parent path.
+    return path
+
+
+def _camera_family_key(url: str) -> str:
+    """Return a stable logical-camera key for one observed HLS candidate URL."""
+    family_path = _camera_family_path(url)
+    origin = _normalized_origin(url, family_path)
+    stable_query = _stable_query_string(url)
+    if stable_query:
+        return f"{origin}{family_path}?{stable_query}"
+    return f"{origin}{family_path}"
+
+
+def _candidate_priority(url: str) -> tuple[int, int, int, str]:
+    """Prefer stable master playlists over session-scoped media/chunk playlists."""
+    parsed = urlparse(url)
+    filename = parsed.path.rsplit("/", 1)[-1]
+    lowered = filename.lower()
+
+    if lowered in {"index.m3u8", "master.m3u8", "playlist.m3u8", "playlists.m3u8"}:
+        rank = 0
+    elif _UUID_PLAYLIST_RE.match(filename):
+        rank = 0
+    elif (
+        _CHUNKLIST_RE.match(filename)
+        or _OUTPUT_RE.match(filename)
+        or re.fullmatch(r"video\d*_stream\.m3u8", lowered)
+        or ("/tracks-v" in parsed.path.lower())
+    ):
+        rank = 2
+    else:
+        rank = 1
+
+    # Stable URLs without volatile query strings are preferred when two mirrors are equal.
+    return (rank, bool(parsed.query), len(url), url)
+
+
+def _select_camera_candidates(candidate_urls: set[str]) -> list[str]:
+    """Select one representative HLS URL per inferred physical-camera family."""
+    groups: dict[str, list[str]] = {}
+    for url in sorted(candidate_urls):
+        groups.setdefault(_camera_family_key(url), []).append(url)
+
+    selected = [min(group, key=_candidate_priority) for group in groups.values()]
+    selected.sort()
+    if len(selected) != len(candidate_urls):
+        log(
+            f"[hls] grouped {len(candidate_urls)} observed playlist(s) into "
+            f"{len(selected)} camera family candidate(s)"
+        )
+    return selected
+
+
 async def resolve_candidate(
     url: str,
     *,
@@ -122,9 +284,9 @@ async def resolve_cameras(
     *,
     client: Any | None = None,
 ) -> list[HlsVariant]:
-    """Resolve all HLS candidates concurrently and deduplicate logical cameras."""
-    ordered_urls = sorted(candidate_urls)
-    log(f"[hls] resolving {len(ordered_urls)} candidate playlist(s) in parallel")
+    """Resolve HLS candidates concurrently after collapsing duplicate camera families."""
+    ordered_urls = _select_camera_candidates(candidate_urls)
+    log(f"[hls] resolving {len(ordered_urls)} camera candidate playlist(s) in parallel")
 
     async def resolve_one(url: str) -> tuple[HlsVariant, set[str]]:
         """Resolve one candidate while preserving monkeypatch-friendly optional clients."""
@@ -132,28 +294,19 @@ async def resolve_cameras(
             return await resolve_candidate(url)
         return await resolve_candidate(url, client=client)
 
-    # Candidate playlists are independent network requests, so resolve them together.
+    # Different physical-camera families are independent network requests, so resolve them together.
     results = await asyncio.gather(
         *(resolve_one(url) for url in ordered_urls),
         return_exceptions=True,
     )
 
-    resolved: dict[str, tuple[HlsVariant, set[str]]] = {}
-    referenced_variants: set[str] = set()
-    for url, result in zip(ordered_urls, results, strict=True):
-        if isinstance(result, BaseException):
-            log(f"[hls] candidate failed {url}: {type(result).__name__}: {result}")
-            continue
-        best, variants = result
-        resolved[url] = (best, variants)
-        referenced_variants.update(variants)
-
     cameras: list[HlsVariant] = []
     seen_stream_urls: set[str] = set()
-    for candidate_url, (best, _) in resolved.items():
-        # Ignore variants also observed by the browser when their master is present.
-        if candidate_url in referenced_variants:
+    for candidate_url, result in zip(ordered_urls, results, strict=True):
+        if isinstance(result, BaseException):
+            log(f"[hls] candidate failed {candidate_url}: {type(result).__name__}: {result}")
             continue
+        best, _ = result
         if best.url in seen_stream_urls:
             continue
         seen_stream_urls.add(best.url)
