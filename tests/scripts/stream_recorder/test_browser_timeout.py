@@ -25,10 +25,6 @@ async def test_browser_target_hard_deadline_releases_slot() -> None:
             """Block forever to model a wedged Playwright navigation."""
             await asyncio.Event().wait()
 
-        async def wait_for_timeout(self, _milliseconds: int) -> None:
-            """Yield without adding artificial latency."""
-            await asyncio.sleep(0)
-
         async def close(self) -> None:
             """Record that timed-out page cleanup completed."""
             closed.set()
@@ -58,6 +54,51 @@ async def test_browser_target_hard_deadline_releases_slot() -> None:
 
 
 @pytest.mark.asyncio
+async def test_hard_deadline_does_not_wait_for_cancellation_resistant_navigation() -> None:
+    """A navigation that suppresses cancellation must not extend the browser target deadline."""
+
+    class Page:
+        """Model a Playwright call that ignores cancellation before eventually returning."""
+
+        def on(self, _event: str, _callback) -> None:
+            """Accept request listeners without emitting requests."""
+            return None
+
+        async def goto(self, _url: str, **_kwargs) -> None:
+            """Suppress cancellation to reproduce a stuck transport operation."""
+            try:
+                await asyncio.sleep(10)
+            except asyncio.CancelledError:
+                await asyncio.sleep(0.20)
+
+        async def close(self) -> None:
+            """Close the synthetic page immediately."""
+            return None
+
+    class Context:
+        """Create the cancellation-resistant synthetic page."""
+
+        async def new_page(self) -> Page:
+            """Return one synthetic page."""
+            return Page()
+
+    session = BrowserSession(context=Context(), page_semaphore=asyncio.Semaphore(1))
+    started = time.monotonic()
+
+    with pytest.raises(TimeoutError):
+        await _visit_browser_target(
+            session,
+            "https://example.test/cancellation-resistant",
+            timeout_ms=20_000,
+            settle_ms=0,
+            hard_timeout_ms=30,
+        )
+
+    # A cooperative asyncio.timeout() implementation would incorrectly take ~0.23s here.
+    assert time.monotonic() - started < 0.12
+
+
+@pytest.mark.asyncio
 async def test_unconfirmed_page_close_poison_browser_instead_of_reusing_slot() -> None:
     """A wedged page close must make an unrecoverable synthetic session fail closed."""
 
@@ -71,10 +112,6 @@ async def test_unconfirmed_page_close_poison_browser_instead_of_reusing_slot() -
         async def goto(self, _url: str, **_kwargs) -> None:
             """Complete navigation immediately."""
             return None
-
-        async def wait_for_timeout(self, _milliseconds: int) -> None:
-            """Yield without adding artificial latency."""
-            await asyncio.sleep(0)
 
         async def close(self) -> None:
             """Block forever to model a stuck renderer cleanup call."""
