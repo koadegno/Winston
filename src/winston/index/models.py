@@ -1,5 +1,6 @@
 """Winston-owned visual index domain models and validation."""
 
+from dataclasses import dataclass
 from enum import StrEnum
 import math
 from pathlib import PurePosixPath
@@ -30,6 +31,13 @@ class VisualIndexConfigurationError(VisualIndexError):
 
 class IncompatibleVisualIndexError(VisualIndexError):
     """Raised when an existing visual index is incompatible with Winston."""
+
+
+@dataclass(frozen=True, slots=True)
+class VisualIndexSession:
+    """Identity of the exact compatible visual collection used by one indexing run."""
+
+    index_instance_id: str
 
 
 class SampleKind(StrEnum):

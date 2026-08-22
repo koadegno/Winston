@@ -9,6 +9,7 @@ from winston.index.models import (
     SampleKind,
     VisualIndexConfigurationError,
     VisualIndexError,
+    VisualIndexSession,
 )
 
 __all__ = [
@@ -19,6 +20,7 @@ __all__ = [
     "VisualIndex",
     "VisualIndexConfigurationError",
     "VisualIndexError",
+    "VisualIndexSession",
     "timestamp_to_microseconds",
     "visual_point_id",
 ]
