@@ -9,9 +9,35 @@ from scripts.stream_recorder.main import main
 from scripts.stream_recorder.sources import Source
 
 
+def test_browser_concurrency_defaults_to_two_and_is_configurable():
+    """CLI browser concurrency is conservative by default and can be overridden."""
+    parser = main_module.build_parser()
+
+    default_args = parser.parse_args(["discover", "--url", "https://example.test"])
+    explicit_args = parser.parse_args([
+        "discover",
+        "--url",
+        "https://example.test",
+        "--browser-concurrency",
+        "3",
+    ])
+    record_args = parser.parse_args([
+        "record",
+        "--xlsb",
+        "places.xlsb",
+        "--browser-concurrency",
+        "1",
+    ])
+
+    assert default_args.browser_concurrency == 2
+    assert explicit_args.browser_concurrency == 3
+    assert record_args.browser_concurrency == 1
+
+
 @pytest.mark.asyncio
 async def test_discover_url_prints_json(monkeypatch, capsys):
     """Single-URL discovery keeps machine-readable JSON on stdout."""
+
     async def fake_discover_url(*_args, **_kwargs):
         """Return one deterministic resolved camera."""
         return {
@@ -29,6 +55,7 @@ async def test_discover_url_prints_json(monkeypatch, capsys):
 @pytest.mark.asyncio
 async def test_candidates_only_skips_hls_resolution(monkeypatch, capsys):
     """Candidates-only discovery never resolves HLS master playlists."""
+
     async def fake_discover_page(*_args, **_kwargs):
         """Return one discovered HLS candidate."""
         return {"https://example.test/master.m3u8"}
@@ -84,12 +111,19 @@ async def test_xlsb_sources_discover_concurrently_and_report_progress(monkeypatc
 @pytest.mark.asyncio
 async def test_xlsb_candidates_only_passes_resolve_false(monkeypatch, tmp_path: Path, capsys):
     """The XLSB CLI path honors candidates-only mode just like single-URL discovery."""
-    observed: dict[str, bool] = {}
+    observed: dict[str, bool | int] = {}
 
-    async def fake_discover_xlsb(_path, *, use_browser_fallback: bool, resolve: bool):
-        """Capture the resolve flag passed by the CLI."""
+    async def fake_discover_xlsb(
+        _path,
+        *,
+        use_browser_fallback: bool,
+        resolve: bool,
+        browser_concurrency: int,
+    ):
+        """Capture the discovery options passed by the CLI."""
         observed["resolve"] = resolve
         observed["browser"] = use_browser_fallback
+        observed["browser_concurrency"] = browser_concurrency
         return []
 
     monkeypatch.setattr(main_module, "_discover_xlsb", fake_discover_xlsb)
@@ -99,9 +133,15 @@ async def test_xlsb_candidates_only_passes_resolve_false(monkeypatch, tmp_path: 
         str(tmp_path / "places.xlsb"),
         "--candidates-only",
         "--no-browser",
+        "--browser-concurrency",
+        "1",
     ]) == 0
     json.loads(capsys.readouterr().out)
-    assert observed == {"resolve": False, "browser": False}
+    assert observed == {
+        "resolve": False,
+        "browser": False,
+        "browser_concurrency": 1,
+    }
 
 
 @pytest.mark.asyncio
