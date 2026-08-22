@@ -65,9 +65,9 @@ class _BoundedOperationTimeout(TimeoutError):
 
 @dataclass(slots=True)
 class BrowserSession:
-    """Share one Chromium context while bounding active source pages."""
+    """Share one Chromium process while bounding isolated active source sessions."""
 
-    context: Any
+    context: Any | None
     page_semaphore: asyncio.Semaphore
     browser: Any | None = None
     browser_type: Any | None = None
@@ -76,7 +76,7 @@ class BrowserSession:
     restart_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     async def recycle(self, *, expected_generation: int, reason: str) -> None:
-        """Recycle a poisoned browser/context before any new renderer is created."""
+        """Recycle a poisoned Chromium process before any new source session is created."""
         async with self.restart_lock:
             # Another page may already have recycled the shared browser while this task waited.
             if expected_generation != self.generation:
@@ -89,9 +89,11 @@ class BrowserSession:
             self.context = None
             self.browser = None
 
+            # ``context`` is retained only as a compatibility seam for synthetic/unit callers.
+            # Real browser sessions use temporary isolated contexts that are closed per source.
             context_closed = await _close_resource_bounded(
                 old_context,
-                "browser context",
+                "legacy browser context",
                 timeout_seconds=DEFAULT_BROWSER_SHUTDOWN_TIMEOUT_SECONDS,
             )
             browser_closed = await _close_resource_bounded(
@@ -110,23 +112,18 @@ class BrowserSession:
                     timeout_seconds=DEFAULT_BROWSER_SHUTDOWN_TIMEOUT_SECONDS,
                     operation="Chromium restart",
                 )
-                new_context = await _await_bounded(
-                    new_browser.new_context(),
-                    timeout_seconds=DEFAULT_BROWSER_SHUTDOWN_TIMEOUT_SECONDS,
-                    operation="browser context restart",
-                )
             except Exception as exc:
                 self.failed = f"browser restart failed: {type(exc).__name__}: {exc}"
                 log(f"[browser] FATAL {self.failed}")
                 return
 
             self.browser = new_browser
-            self.context = new_context
+            self.context = None
             self.failed = None
             log(f"[browser] recycle complete; generation={self.generation}")
 
     async def shutdown(self) -> None:
-        """Bound shared browser shutdown so command completion cannot hang forever."""
+        """Bound shared Chromium shutdown so command completion cannot hang forever."""
         context = self.context
         browser = self.browser
         self.context = None
@@ -134,7 +131,7 @@ class BrowserSession:
 
         context_closed = await _close_resource_bounded(
             context,
-            "browser context",
+            "legacy browser context",
             timeout_seconds=DEFAULT_BROWSER_SHUTDOWN_TIMEOUT_SECONDS,
         )
         browser_closed = await _close_resource_bounded(
@@ -394,6 +391,30 @@ async def _close_page_bounded(
     return closed
 
 
+async def _create_source_context(
+    session: BrowserSession,
+    *,
+    deadline: float,
+    prefix: str,
+) -> tuple[Any, bool]:
+    """Create an isolated source context in real Chromium sessions or reuse a test seam."""
+    if session.browser is not None:
+        context = await _await_bounded(
+            session.browser.new_context(),
+            timeout_seconds=min(
+                DEFAULT_BROWSER_SHUTDOWN_TIMEOUT_SECONDS,
+                _remaining_seconds(deadline),
+            ),
+            operation="isolated source context creation",
+        )
+        log(f"{prefix} isolated browser context created")
+        return context, True
+    if session.context is not None:
+        # Unit tests and lightweight callers can still inject a context without a real browser.
+        return session.context, False
+    raise RuntimeError("browser session has neither Chromium nor a compatibility context")
+
+
 async def _activate_video_elements(page: Any, prefix: str, deadline: float) -> bool:
     """Attempt programmatic playback of videos in the existing source frame tree."""
     attempted = False
@@ -490,7 +511,7 @@ async def _visit_browser_target(
     close_timeout_seconds: float = DEFAULT_BROWSER_PAGE_CLOSE_TIMEOUT_SECONDS,
     label: str | None = None,
 ) -> set[str]:
-    """Observe one source page/frame tree with a non-cooperative hard wall-clock deadline."""
+    """Observe one source page/frame tree inside an isolated bounded browser session."""
     if hard_timeout_ms < 1:
         raise ValueError("hard_timeout_ms must be at least 1")
     if close_timeout_seconds <= 0:
@@ -500,23 +521,29 @@ async def _visit_browser_target(
     queued_at = time.monotonic()
     log(f"{prefix} queued {url}")
 
-    # The semaphore bounds renderer memory; no iframe URL is ever reopened as another page.
+    # The semaphore bounds both isolated contexts and renderer memory. Iframe URLs are never
+    # reopened as separate browser targets; their requests remain visible through the source page.
     async with session.page_semaphore:
         if session.failed:
             raise RuntimeError(session.failed)
         generation = session.generation
         waited = time.monotonic() - queued_at
         log(f"{prefix} slot acquired after {waited:.1f}s")
+        source_context: Any | None = None
+        isolated_context = False
         page: Any | None = None
         streams: set[str] = set()
         stream_seen = asyncio.Event()
         started = time.monotonic()
         deadline = started + (hard_timeout_ms / 1000)
         try:
-            if session.context is None:
-                raise RuntimeError("browser context is unavailable")
+            source_context, isolated_context = await _create_source_context(
+                session,
+                deadline=deadline,
+                prefix=prefix,
+            )
             page = await _await_bounded(
-                session.context.new_page(),
+                source_context.new_page(),
                 timeout_seconds=_remaining_seconds(deadline),
                 operation=f"new page {url}",
             )
@@ -601,20 +628,33 @@ async def _visit_browser_target(
             )
             raise
         finally:
+            page_closed = True
             if page is not None:
-                closed = await _close_page_bounded(
+                page_closed = await _close_page_bounded(
                     page,
                     url,
                     timeout_seconds=close_timeout_seconds,
                 )
-                if not closed:
-                    # Never release a slot as healthy after an unconfirmed renderer cleanup.
-                    await session.recycle(
-                        expected_generation=generation,
-                        reason=f"page cleanup failed for {url}",
-                    )
-                    if session.failed:
-                        raise RuntimeError(session.failed)
+
+            context_closed = True
+            if isolated_context and source_context is not None:
+                context_closed = await _close_resource_bounded(
+                    source_context,
+                    f"source context {url}",
+                    timeout_seconds=close_timeout_seconds,
+                )
+                if context_closed:
+                    log(f"{prefix} isolated browser context closed")
+
+            if not page_closed or not context_closed:
+                # Never release a slot as healthy after unconfirmed source-session cleanup. Closing
+                # Chromium also terminates every renderer/context belonging to the poisoned process.
+                await session.recycle(
+                    expected_generation=generation,
+                    reason=f"source cleanup failed for {url}",
+                )
+                if session.failed:
+                    raise RuntimeError(session.failed)
 
 
 @asynccontextmanager
@@ -623,7 +663,7 @@ async def browser_session(
     *,
     max_pages: int = DEFAULT_BROWSER_CONCURRENCY,
 ) -> AsyncIterator[BrowserSession | None]:
-    """Yield one Chromium process/context with bounded concurrent source tabs."""
+    """Yield one Chromium process with bounded, isolated per-source browser contexts."""
     if not enabled:
         yield None
         return
@@ -635,7 +675,7 @@ async def browser_session(
     except ImportError as exc:
         raise RuntimeError("playwright is required for browser-based stream discovery") from exc
 
-    log(f"[browser] launching one Chromium process; max {max_pages} active source tab(s)")
+    log(f"[browser] launching one Chromium process; max {max_pages} active source session(s)")
     manager = async_playwright()
     playwright = await manager.start()
     session: BrowserSession | None = None
@@ -645,18 +685,13 @@ async def browser_session(
             timeout_seconds=DEFAULT_BROWSER_SHUTDOWN_TIMEOUT_SECONDS,
             operation="Chromium launch",
         )
-        context = await _await_bounded(
-            browser.new_context(),
-            timeout_seconds=DEFAULT_BROWSER_SHUTDOWN_TIMEOUT_SECONDS,
-            operation="browser context creation",
-        )
         session = BrowserSession(
-            context=context,
+            context=None,
             page_semaphore=asyncio.Semaphore(max_pages),
             browser=browser,
             browser_type=playwright.chromium,
         )
-        log("[browser] Chromium ready; one shared browser context created")
+        log("[browser] Chromium ready; source browser contexts are isolated per active page")
         yield session
     finally:
         log("[browser] shutting down shared Chromium")
@@ -697,7 +732,7 @@ async def discover_browser(
                 label=label,
             )
         except Exception as exc:
-            # If another tab forced a successful recycle, retry this source once on the new context.
+            # If another source forced a successful recycle, retry this source once on new Chromium.
             if attempt == 0 and browser.generation != generation and not browser.failed:
                 log(f"{prefix} retry after shared browser recycle")
                 continue
