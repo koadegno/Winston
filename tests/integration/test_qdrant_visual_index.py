@@ -1,3 +1,5 @@
+from uuid import UUID
+
 import numpy as np
 import pytest
 from qdrant_client import AsyncQdrantClient, models
@@ -17,6 +19,8 @@ from winston.sampling.regions import RegionKind
 
 QDRANT_URL = "http://localhost:6333"
 IDENTITY = EmbeddingIdentity("jinaai/jina-clip-v1", 768, 1)
+DATASET_ID = "8f7ad0c0-7ab7-4ec0-9025-22f40dd70c4a"
+INCOMPATIBLE_INSTANCE_ID = "0f27f24e-7436-4c46-9260-4a37f419b3a6"
 
 
 def make_visual() -> IndexedVisual:
@@ -36,7 +40,7 @@ def make_visual() -> IndexedVisual:
 
 @pytest.mark.asyncio
 async def test_real_qdrant_collection_and_idempotent_upsert() -> None:
-    """Real Qdrant 1.18.2 must preserve Winston collection identity and idempotent point semantics."""
+    """Real Qdrant 1.18.2 must preserve Winston ownership and idempotent point semantics."""
     collection = "winston_visual_integration"
     client = AsyncQdrantClient(url=QDRANT_URL)
     index = QdrantVisualIndex(
@@ -44,7 +48,7 @@ async def test_real_qdrant_collection_and_idempotent_upsert() -> None:
         client=client,
     )
 
-    await index.ensure_compatible(IDENTITY)
+    session = await index.ensure_compatible(IDENTITY, DATASET_ID)
 
     info = await client.get_collection(collection)
     assert isinstance(info.config.params.vectors, dict)
@@ -52,13 +56,16 @@ async def test_real_qdrant_collection_and_idempotent_upsert() -> None:
     assert vector.size == 768
     assert vector.distance is models.Distance.COSINE
     assert info.config.metadata == {
-        "winston_schema_version": 1,
+        "winston_schema_version": 2,
+        "dataset_instance_id": DATASET_ID,
+        "index_instance_id": session.index_instance_id,
         "model_id": "jinaai/jina-clip-v1",
         "dimension": 768,
         "preprocessing_version": 1,
         "vector_name": "visual",
         "distance": "cosine",
     }
+    assert str(UUID(session.index_instance_id)) == session.index_instance_id
 
     visual = make_visual()
     await index.upsert([visual])
@@ -108,7 +115,9 @@ async def test_real_qdrant_rejects_incompatible_collection_without_mutation() ->
             "visual": models.VectorParams(size=512, distance=models.Distance.COSINE)
         },
         metadata={
-            "winston_schema_version": 1,
+            "winston_schema_version": 2,
+            "dataset_instance_id": DATASET_ID,
+            "index_instance_id": INCOMPATIBLE_INSTANCE_ID,
             "model_id": "jinaai/jina-clip-v1",
             "dimension": 768,
             "preprocessing_version": 1,
@@ -122,7 +131,7 @@ async def test_real_qdrant_rejects_incompatible_collection_without_mutation() ->
     )
 
     with pytest.raises(IncompatibleVisualIndexError, match="size=768.*size=512"):
-        await index.ensure_compatible(IDENTITY)
+        await index.ensure_compatible(IDENTITY, DATASET_ID)
 
     info = await client.get_collection(collection)
     assert isinstance(info.config.params.vectors, dict)
