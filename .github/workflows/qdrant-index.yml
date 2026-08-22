@@ -16,32 +16,26 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    services:
+      qdrant:
+        image: qdrant/qdrant:v1.18.2
+        ports:
+          - 6333:6333
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.pull_request.head.ref }}
       - uses: actions/setup-python@v5
         with:
           python-version: '3.13'
       - name: Install uv
         uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
-      - name: Refresh lockfile when dependency metadata changed
-        if: github.event_name == 'pull_request'
-        run: |
-          uv lock
-          if ! git diff --quiet -- uv.lock; then
-            git config user.name 'github-actions[bot]'
-            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-            git add uv.lock
-            git commit -m 'chore: refresh uv lockfile'
-            git push origin HEAD:${{ github.event.pull_request.head.ref }}
-          fi
+      - name: Verify lockfile
+        run: uv lock --check
       - name: Install focused test dependencies
         run: |
           python -m pip install \
@@ -50,14 +44,27 @@ jobs:
             'pydantic-settings>=2.15.0' \
             'pytest>=9.1.1' \
             'pytest-asyncio>=1.4.0' \
-            'qdrant-client>=1.18,<1.19'
+            'qdrant-client==1.18.0'
           python -m pip install -e . --no-deps
+      - name: Wait for Qdrant 1.18.2
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attempt in {1..30}; do
+            if curl --fail --silent http://localhost:6333/collections >/dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          echo 'Qdrant did not become ready on port 6333' >&2
+          exit 1
       - name: Run Phase 1D unit tests
         run: >-
           python -m pytest -q
           tests/src/winston/test_config.py
           tests/src/winston/ingest/test_identity.py
-          tests/src/winston/index/test_models.py
-          tests/src/winston/index/test_point_identity.py
-          tests/src/winston/index/test_qdrant.py
-          tests/src/winston/index/test_qdrant_upsert.py
+          tests/src/winston/index
+      - name: Run real Qdrant integration tests
+        run: python -m pytest -q tests/integration/test_qdrant_visual_index.py
+      - name: Compile Winston source
+        run: python -m compileall -q src/winston
