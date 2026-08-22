@@ -4,7 +4,9 @@ import asyncio
 import json
 from collections.abc import AsyncIterator
 from pathlib import Path
-from typing import Any
+from typing import cast
+
+from pydantic import JsonValue
 
 from winston.config import get_config
 from winston.ingest.models import VideoMetadata
@@ -12,11 +14,16 @@ from winston.sampling.base import FrameSampler
 from winston.sampling.models import SampledFrame
 
 
+type JsonObject = dict[str, JsonValue]
+
+
 class FrameSamplingError(RuntimeError):
     """Raised when keyframe discovery or decoding fails."""
 
 
-async def _run_ffprobe(path: Path) -> dict[str, Any]:
+async def _run_ffprobe(path: Path) -> JsonObject:
+    """Run ffprobe asynchronously and return its validated JSON object."""
+    # Keep probing off the event loop so multiple videos can be processed concurrently.
     config = get_config()
     command = [
         config.ffprobe_binary,
@@ -48,15 +55,17 @@ async def _run_ffprobe(path: Path) -> dict[str, Any]:
         raise FrameSamplingError(f"Failed to inspect keyframes for {path}: {message}")
 
     try:
-        payload = json.loads(stdout)
+        payload = cast(JsonValue, json.loads(stdout))
     except json.JSONDecodeError as exc:
         raise FrameSamplingError(f"ffprobe returned invalid JSON for {path}") from exc
     if not isinstance(payload, dict):
         raise FrameSamplingError(f"ffprobe returned an unexpected JSON document for {path}")
-    return payload
+    return cast(JsonObject, payload)
 
 
-def _parse_keyframe_timestamps(path: Path, payload: dict[str, Any]) -> tuple[float, ...]:
+def _parse_keyframe_timestamps(path: Path, payload: JsonObject) -> tuple[float, ...]:
+    """Extract unique decoder-keyframe timestamps while preserving source order."""
+    # Validate ffprobe output before associating timestamps with decoded frame bytes.
     frames = payload.get("frames")
     if not isinstance(frames, list):
         raise FrameSamplingError(f"ffprobe returned no frame list for {path}")
@@ -83,16 +92,21 @@ def _parse_keyframe_timestamps(path: Path, payload: dict[str, Any]) -> tuple[flo
 
 async def probe_keyframe_timestamps(path: Path) -> tuple[float, ...]:
     """Return unique decoder-keyframe timestamps in source order."""
+    # Keep subprocess execution and JSON interpretation behind one public helper.
     return _parse_keyframe_timestamps(path, await _run_ffprobe(path))
 
 
 async def _read_stderr(stream: asyncio.StreamReader | None) -> bytes:
+    """Drain a subprocess stderr stream without blocking frame decoding."""
+    # Reading stderr concurrently prevents FFmpeg from blocking on a full pipe.
     if stream is None:
         return b""
     return await stream.read()
 
 
 async def _stop_process(process: asyncio.subprocess.Process) -> None:
+    """Terminate a running subprocess and wait until it has exited."""
+    # Always reap the child process so cancelled or partially consumed sampling leaves no FFmpeg behind.
     if process.returncode is None:
         process.terminate()
     await process.wait()
@@ -102,6 +116,8 @@ class KeyframeSampler(FrameSampler):
     """Yield decoder keyframes as RGB24 frames without container-specific logic."""
 
     async def sample(self, video: VideoMetadata) -> AsyncIterator[SampledFrame]:
+        """Stream decoded keyframes paired with their exact source timestamps."""
+        # Probe timestamps first so each streamed RGB frame can be paired deterministically.
         timestamps = await probe_keyframe_timestamps(video.path)
         config = get_config()
         command = [
