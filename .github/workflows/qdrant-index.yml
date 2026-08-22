@@ -58,4 +58,4 @@ jobs:
           tests/src/winston/test_config.py
           tests/src/winston/ingest/test_identity.py
           tests/src/winston/index/test_models.py
-          tests/src/winston/index/test_identity.py
+          tests/src/winston/index/test_point_identity.py
