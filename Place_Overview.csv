@@ -1,0 +1,48 @@
+id,place,city,country,url,description,enabled,disabled_reason
+4,Town Square Assisi,Assisi,Italy,https://youtu.be/CkNeltsc5ps,,false,youtube-out-of-scope
+7,Piazza Silvestri,Bevagna,Italy,https://youtu.be/PfBPe5Jfzxo,,false,youtube-out-of-scope
+8,Marktplatz Biberach,Biberach,Germany,https://www.youtube.com/watch?v=FR8I31kFf20,,false,youtube-out-of-scope
+9,Brunnparken,Varberg,Sweden,https://youtu.be/IEDF51akADs,,false,youtube-out-of-scope
+16,Rynek Fountain,Wolsztyn,Poland,https://youtu.be/X5zXSVMHRhk,,false,youtube-out-of-scope
+20,Hanacke Namesti,Kromeriz,Czech republic,https://youtu.be/-90Gh2mFFGU,,false,youtube-out-of-scope
+45,Piazza del comune,Montefalco,Italy,https://youtu.be/kGXU_4S5FgQ,,false,youtube-out-of-scope
+48,Mali trg / Nicole Pastica,Prijedor,Bosnia and herzegowina,https://www.prijedorgrad.org/sr-BA/gradsko-oko-live.html,,true,
+52,Marktplatz,Schwabisch Gmund,Germany,https://www.schwaebisch-gmuend.de/webcam-marktplatz.html,,true,
+61,Markt,Sittard,Netherlands,https://webcamsittard.nl/index.php/nl/camera1,Camstreamer player currently resolves to YouTube,false,youtube-backed-player
+64,Novi Sad,Novi Sad,Serbia,https://kamere.24sedam.rs/?grad=novi-sad&kamera=43&naziv=trg-slobode,,true,
+67,Mierove,Trencin,Slovakia,https://www.youtube.com/watch?v=wGSt9yj5asc,,false,youtube-out-of-scope
+68,Sturovo,Trencin,Slovakia,https://www.youtube.com/watch?v=VzP4csGTyzM,,false,youtube-out-of-scope
+74,Praza Major,Celanova,Spain,https://www.g24.gal/-/celanova,,true,
+82,Plaza del Ayuntamiento,Villamartin,Spain,https://www.skylinewebcams.com/en/webcam/espana/andalucia/cadiz/villamartin-plaza-del-ayuntamiento.html,,true,
+87,Namesti 28. rijna,Luhacovice,Czech republic,https://youtu.be/l7WQYC733Ks,,false,youtube-out-of-scope
+89,Market square,Most,Czech republic,https://www.ipcamlive.com/622f38aa34665,,true,
+90-1,Namesti T. G. M.,Pribram,Czech republic,https://pribram.eu/pribram-zive-namesti-t-g-m.html,,true,
+90-2,Namesti 17. listopadu,Pribram,Czech republic,https://pribram.eu/pribram-zive-namesti-17-listopadu.html,,true,
+90-3,Dvorakovo nabrezi,Pribram,Czech republic,https://pribram.eu/pribram-zive-dvorakovo-nabrezi.html,,true,
+90-4,SK Spartak,Pribram,Czech republic,https://pribram.eu/pribram-zive-sk-spartak.html,,true,
+90-5,SK Spartak 3,Pribram,Czech republic,https://pribram.eu/pribram-zive-sk-spartak-3.html,,true,
+90-6,Namesti J. A. Alise,Pribram,Czech republic,https://pribram.eu/pribram-zive-namesti-j-a-alise.html,,true,
+91,Namesti Miru,Zlin,Czech republic,https://youtu.be/cMukxZRThvk,,false,youtube-out-of-scope
+92,Market square,Valasske Mezirici,Czech republic,https://www.valasskemezirici.cz/vismo/webkamera.asp,,true,
+93,Namesti T.G. Masaryka,Vrchlabi,Czech republic,https://webkamery-krkonose.cz/kamera/1-vrchlab-nmst-t-g-masaryka,,true,
+98,Market square,Szentendre,Hungary,https://www.ipcamlive.com/570b5e81b9c8e,,true,
+99,Jubilee square,Leicester,UK,https://www.skylinewebcams.com/webcam/united-kingdom/england/leicester/leicester.html,,true,
+102,Market square,Bielsko Biala,Poland,https://bielsko-biala.pl/kamera/rynek,,true,
+103,Plac Polonii Amerykanskiej,Brzeg,Poland,https://brzeg.pl/kamera-on-line/,,true,
+104,Kazimierz Wielki Square,Brzesko,Poland,https://de.worldcam.eu/liveview/10391,,true,
+105,Market square,Brzesko,Poland,https://www.brzesko.pl/artykul/150,kamera,,true,
+110,Skwer przy Wiezy Brackiej / Plac 3 Maja,Luban,Poland,https://luban.pl/nazywo,,true,
+112,Market square,Czersk,Poland,https://czersk.pl/strona/552-kamera-line,,true,
+113,Market Square,Debica,Poland,https://www.kamery24.org/i24/index.php/test/82-debica-rynek,,true,
+114,Market square,Frombork,Poland,https://www.tvbraniewo24.pl/kamery/22,frombork-rynek,,true,
+118,Market square,Jaworzno,Poland,https://www.jaworzno.pl/2022/04/04/rynek-widok-od-strony-biblioteki/,,true,
+119,Cieplice - Lalka,Jelenia Gora,Poland,https://www.jeleniagora.pl/news/link-do-kamery-przy-ulicy-wiejskiej,,true,
+122,Plac Jana Pawla,Ozorkow,Poland,https://www.youtube.com/watch?v=z_f8VHI1CHY,,false,youtube-out-of-scope
+124,Plac Maja,Swidnik,Poland,https://de.worldcam.eu/liveview/19226,,true,
+125,Place,Lublin,Poland,https://lublin.eu/lublin/o-miescie/lublin-na-zywo/widok-na-krakowskie-przedmiescie/,,true,
+126,Market place,Lubliniec,Poland,https://lubliniec.aztv.pl/,,true,
+128,Market place,Myslenice,Poland,https://myslenice-rynek.webcamera.pl/,,true,
+130,Nowy Targ,Nowy Targ,Poland,https://nowytarg.webcamera.pl/,,true,
+131,Playa del Sardinero,Santander,Spain,https://www.skylinewebcams.com/en/webcam/espana/cantabria/santander/playa-del-sardinero.html,,true,
+132,Sutton Coldfield,Birmingham,UK,https://www.skylinewebcams.com/en/webcam/united-kingdom/england/birmingham/sutton-coldfield.html,,true,
+133,Boccadasse,Genoa,Italy,https://www.skylinewebcams.com/en/webcam/italia/liguria/genova/boccadasse-genova.html,,true,
