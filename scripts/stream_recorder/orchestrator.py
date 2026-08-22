@@ -92,15 +92,23 @@ async def discover_source_cameras(
 ) -> list[Camera]:
     """Discover and resolve every logical HLS camera exposed by one source page."""
     log(f"[source {source.id}] discovery start: {source.place} - {source.url}")
+    browser_observed_urls: set[str] = set()
     candidates = await discover_page(
         source.url,
         use_browser=use_browser,
         browser=browser,
         client=client,
         label=f"source {source.id}",
+        browser_observed_urls=browser_observed_urls,
     )
     log(f"[source {source.id}] {len(candidates)} HLS candidate(s); resolving cameras")
-    cameras = assign_camera_ids(await resolve_cameras(candidates, client=client))
+    cameras = assign_camera_ids(
+        await resolve_cameras(
+            candidates,
+            client=client,
+            browser_observed_urls=browser_observed_urls,
+        )
+    )
     log(f"[source {source.id}] discovery complete: {len(cameras)} camera(s)")
     return cameras
 
