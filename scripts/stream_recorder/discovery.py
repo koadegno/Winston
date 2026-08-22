@@ -17,6 +17,8 @@ from .log import log
 
 
 DEFAULT_BROWSER_CONCURRENCY = 2
+DEFAULT_BROWSER_TARGET_HARD_TIMEOUT_MS = 30_000
+DEFAULT_BROWSER_PAGE_CLOSE_TIMEOUT_SECONDS = 3.0
 _BROWSER_STREAM_GRACE_MS = 750
 
 _M3U8_RE = re.compile(
@@ -144,61 +146,104 @@ async def _iframe_urls(page: Any) -> set[str]:
     }
 
 
+async def _close_page_bounded(
+    page: Any,
+    url: str,
+    *,
+    timeout_seconds: float,
+) -> None:
+    """Close one Playwright page without allowing cleanup to block the browser queue."""
+    try:
+        await asyncio.wait_for(page.close(), timeout=timeout_seconds)
+    except TimeoutError:
+        log(f"[browser] WARN close timeout after {timeout_seconds:.1f}s: {url}")
+    except Exception as exc:
+        log(f"[browser] WARN close failed {url}: {type(exc).__name__}: {exc}")
+    else:
+        log(f"[browser] closed {url}")
+
+
 async def _visit_browser_target(
     session: BrowserSession,
     url: str,
     *,
     timeout_ms: int,
     settle_ms: int,
+    hard_timeout_ms: int = DEFAULT_BROWSER_TARGET_HARD_TIMEOUT_MS,
+    close_timeout_seconds: float = DEFAULT_BROWSER_PAGE_CLOSE_TIMEOUT_SECONDS,
 ) -> tuple[set[str], set[str]]:
-    """Observe one target in a shared context while respecting the global tab limit."""
+    """Observe one target with a hard deadline while respecting the global tab limit."""
+    if hard_timeout_ms < 1:
+        raise ValueError("hard_timeout_ms must be at least 1")
+    if close_timeout_seconds <= 0:
+        raise ValueError("close_timeout_seconds must be greater than 0")
+
     streams: set[str] = set()
     stream_seen = asyncio.Event()
+    queued_at = time.monotonic()
     log(f"[browser] queued {url}")
 
     # A renderer can use hundreds of MB. Keep only a small bounded number alive at once.
     async with session.page_semaphore:
-        page = await session.context.new_page()
+        waited = time.monotonic() - queued_at
+        log(f"[browser] slot acquired after {waited:.1f}s: {url}")
+        page: Any | None = None
         started = time.monotonic()
-        log(f"[browser] open {url}")
         try:
+            # Playwright's own navigation timeout is not sufficient when its transport wedges.
+            # This asyncio deadline bounds the whole active page operation independently.
+            async with asyncio.timeout(hard_timeout_ms / 1000):
+                page = await session.context.new_page()
+                log(f"[browser] open {url}")
 
-            def collect(request: Any) -> None:
-                """Capture HLS requests emitted while the target page is running."""
-                if ".m3u8" not in request.url.lower():
-                    return
-                if request.url not in streams:
-                    log(f"[browser] HLS {request.url}")
-                streams.add(request.url)
-                stream_seen.set()
+                def collect(request: Any) -> None:
+                    """Capture HLS requests emitted while the target page is running."""
+                    if ".m3u8" not in request.url.lower():
+                        return
+                    if request.url not in streams:
+                        log(f"[browser] HLS {request.url}")
+                    streams.add(request.url)
+                    stream_seen.set()
 
-            page.on("request", collect)
-            await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
-            log(f"[browser] loaded {url}")
+                page.on("request", collect)
+                await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+                log(f"[browser] loaded {url}")
 
-            if settle_ms > 0:
-                if streams:
-                    # Once HLS is visible, keep a short grace window for sibling cameras/variants.
-                    await page.wait_for_timeout(min(settle_ms, _BROWSER_STREAM_GRACE_MS))
-                else:
-                    # Pages without an immediate stream still get the full settle window.
-                    try:
-                        await asyncio.wait_for(stream_seen.wait(), timeout=settle_ms / 1000)
-                    except TimeoutError:
-                        pass
-                    else:
+                if settle_ms > 0:
+                    if streams:
+                        # Once HLS is visible, keep a short grace window for sibling cameras/variants.
                         await page.wait_for_timeout(min(settle_ms, _BROWSER_STREAM_GRACE_MS))
+                    else:
+                        # Pages without an immediate stream still get the full settle window.
+                        try:
+                            await asyncio.wait_for(stream_seen.wait(), timeout=settle_ms / 1000)
+                        except TimeoutError:
+                            pass
+                        else:
+                            await page.wait_for_timeout(min(settle_ms, _BROWSER_STREAM_GRACE_MS))
 
-            iframe_urls = await _iframe_urls(page)
+                iframe_urls = await _iframe_urls(page)
+                elapsed = time.monotonic() - started
+                log(
+                    f"[browser] done {url}: {len(streams)} HLS, "
+                    f"{len(iframe_urls)} iframe(s) in {elapsed:.1f}s"
+                )
+                return streams, iframe_urls
+        except TimeoutError:
             elapsed = time.monotonic() - started
             log(
-                f"[browser] done {url}: {len(streams)} HLS, "
-                f"{len(iframe_urls)} iframe(s) in {elapsed:.1f}s"
+                f"[browser] HARD TIMEOUT {url} after {elapsed:.1f}s "
+                f"(limit={hard_timeout_ms / 1000:.1f}s)"
             )
-            return streams, iframe_urls
+            raise
         finally:
-            await page.close()
-            log(f"[browser] closed {url}")
+            if page is not None:
+                # Cleanup has its own bound so a broken renderer cannot keep the semaphore forever.
+                await _close_page_bounded(
+                    page,
+                    url,
+                    timeout_seconds=close_timeout_seconds,
+                )
 
 
 @asynccontextmanager
