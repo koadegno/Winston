@@ -60,3 +60,4 @@ jobs:
           tests/src/winston/index/test_models.py
           tests/src/winston/index/test_point_identity.py
           tests/src/winston/index/test_qdrant.py
+          tests/src/winston/index/test_qdrant_upsert.py
