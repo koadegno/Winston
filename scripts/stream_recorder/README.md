@@ -18,23 +18,35 @@ uv sync --extra script
 uv run python -m playwright install chromium
 ```
 
+## Source list
+
+`Place_Overview.csv` is the maintained source list used for discovery and recording. It contains enabled and disabled rows so known exclusions remain documented instead of disappearing from history.
+
+The columns are:
+
+```text
+id,place,city,country,url,description,enabled,disabled_reason
+```
+
+Disabled rows and YouTube URLs are skipped before discovery. The legacy `Place_Overview.xlsb` loader remains supported for compatibility, but new source maintenance belongs in the CSV.
+
 ## Concurrency model
 
 The recorder schedules independent I/O concurrently without allowing browser renderers to exhaust system memory:
 
-- all source tasks from `Place_Overview.xlsb` are scheduled concurrently;
+- all enabled source tasks are scheduled concurrently;
 - direct HTTP inspection is concurrent and does not consume browser tabs;
 - all HLS candidates for a page are resolved concurrently;
 - all sources record concurrently;
 - all cameras belonging to a source record concurrently;
 - FFmpeg processes are awaited asynchronously, so one camera never blocks another;
 - Playwright uses exactly one Chromium process and one shared browser context;
-- source pages and iframe/player targets use tabs in that shared context;
-- a global semaphore limits active Playwright tabs to **2 by default** across the entire command.
+- each source is opened once as a tab in that shared context;
+- a global semaphore limits active Playwright tabs to **4 by default** across the entire command.
 
-The browser limit is configurable with `--browser-concurrency N`. Increasing it can speed up discovery but also increases RAM use because each active Chromium renderer can consume hundreds of MB.
+The browser limit is configurable with `--browser-concurrency N`. Lower it on RAM-constrained machines; increasing it can speed up discovery but each active Chromium renderer can consume hundreds of MB.
 
-Playwright listens to the complete page network, including requests emitted by normally loaded frames. If a page already exposes one or more HLS streams, its iframe URLs are **not reopened as separate browser targets**. Separate iframe crawling is only used when the parent page exposed no HLS at all. This avoids duplicating expensive browser work while preserving the iframe fallback needed by third-party players.
+Playwright listens to network requests from the complete loaded frame tree. Embedded iframe URLs are **not reopened recursively**. If a third-party player does not start automatically, discovery tries a visible Play interaction inside the already loaded frame tree and only then falls back to programmatic `video.play()`.
 
 ## Progress logs
 
@@ -42,26 +54,29 @@ Machine-readable discovery JSON is written to stdout. Detailed progress is writt
 
 The logs show:
 
-- every source task starting and completing;
-- direct HTTP request start, completion time, candidate count, and errors;
+- each HTTP source request starting, completing, timing out, or failing;
 - Chromium startup and shutdown;
-- every browser target entering the queue;
-- every browser tab opening, loading, finding HLS requests, and closing;
-- iframe fallback depth and whether iframe targets are skipped;
+- each browser source entering the queue and acquiring a tab slot;
+- browser page open/load/close events;
+- media activation attempts when a player needs interaction;
+- every accepted HLS request as it is observed;
 - HLS master/variant resolution and selected quality;
+- TLS-only HLS fallback when an already discovered stream has a broken certificate;
 - source/camera metadata creation;
-- each FFmpeg process starting, its PID, output file, duration, and exit code;
+- each FFmpeg process starting, output path, duration, and exit code;
 - retry and HLS rediscovery after FFmpeg failures.
 
 Typical browser progress looks like:
 
 ```text
-[00:50:45] [browser] queued https://example.com/webcam
-[00:50:45] [browser] open https://example.com/webcam
-[00:50:48] [browser] HLS https://cdn.example.com/live/stream.m3u8
-[00:50:48] [browser] done https://example.com/webcam: 1 HLS, 2 iframe(s) in 3.2s
-[00:50:48] [browser] closed https://example.com/webcam
-[00:50:48] [browser] skip 2 iframe target(s) under https://example.com/webcam: HLS already observed on parent page
+[00:50:45] [browser][source 112] queued https://example.com/webcam
+[00:50:45] [browser][source 112] slot acquired after 0.0s
+[00:50:45] [browser][source 112] open https://example.com/webcam
+[00:50:48] [browser][source 112] no HLS after initial load; trying user-gesture media activation
+[00:50:49] [browser][source 112] media activation: clicked 'video' frame=https://player.example/embed
+[00:50:50] [browser][source 112] HLS https://cdn.example.com/live/stream.m3u8
+[00:50:50] [browser][source 112] done in 5.2s: 1 HLS candidate(s)
+[00:50:50] [browser] closed https://example.com/webcam
 ```
 
 ## Discover one page
@@ -81,28 +96,35 @@ uv run python -m scripts.stream_recorder.main discover \
   --candidates-only
 ```
 
-## Discover every supported source in Place_Overview.xlsb
+## Discover every enabled source
+
+```bash
+uv run python -m scripts.stream_recorder.main discover \
+  --sources Place_Overview.csv
+```
+
+All enabled non-YouTube source tasks are scheduled immediately. HTTP discovery runs concurrently, while Playwright allows at most four active source tabs by default. Completion progress is written immediately to stderr while the final deterministic JSON array remains on stdout.
+
+Use a lower browser limit when needed:
+
+```bash
+uv run python -m scripts.stream_recorder.main discover \
+  --sources Place_Overview.csv \
+  --browser-concurrency 1
+```
+
+The old CLI spelling remains accepted for legacy workbooks:
 
 ```bash
 uv run python -m scripts.stream_recorder.main discover \
   --xlsb Place_Overview.xlsb
 ```
 
-All non-YouTube source tasks are scheduled immediately, but only two Playwright tabs are active at once by default. HTTP work continues concurrently while browser work waits for a tab slot. Completion progress is written immediately to stderr while the final deterministic JSON array remains on stdout.
-
-Use a different browser limit when needed:
-
-```bash
-uv run python -m scripts.stream_recorder.main discover \
-  --xlsb Place_Overview.xlsb \
-  --browser-concurrency 1
-```
-
 ## Record
 
 ```bash
 uv run python -m scripts.stream_recorder.main record \
-  --xlsb Place_Overview.xlsb \
+  --sources Place_Overview.csv \
   --output datasets/recordings
 ```
 
@@ -112,9 +134,9 @@ Record only selected source IDs:
 
 ```bash
 uv run python -m scripts.stream_recorder.main record \
-  --xlsb Place_Overview.xlsb \
-  --source-id 61 \
-  --source-id 82
+  --sources Place_Overview.csv \
+  --source-id 112 \
+  --source-id 113
 ```
 
 The output layout is:
