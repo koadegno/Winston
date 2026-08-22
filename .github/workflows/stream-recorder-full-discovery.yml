@@ -1,0 +1,116 @@
+name: Stream recorder full discovery
+
+on:
+  push:
+    branches:
+      - feat/public-stream-recorder
+    paths:
+      - '.github/workflows/stream-recorder-full-discovery.yml'
+  workflow_dispatch:
+
+jobs:
+  full-discovery:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install project and script dependencies
+        run: python -m pip install -e '.[script]'
+
+      - name: Install Chromium
+        run: python -m playwright install --with-deps chromium
+
+      - name: Download official Place Overview workbook
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl \
+            --fail \
+            --location \
+            --retry 8 \
+            --retry-all-errors \
+            --retry-delay 5 \
+            --output /tmp/Place_Overview.xlsb \
+            'https://zenodo.org/records/18267205/files/Place_Overview.xlsb?download=1'
+
+          echo '86be3ba9bd17fc4cfcc286517f79cd38  /tmp/Place_Overview.xlsb' | md5sum --check --strict
+          ls -lh /tmp/Place_Overview.xlsb
+
+      - name: Discover every non-YouTube source from the workbook
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          timeout 75m python -m scripts.stream_recorder.main discover \
+            --xlsb /tmp/Place_Overview.xlsb \
+            --browser-concurrency 2 \
+            > /tmp/full-discovery.json \
+            2> >(tee /tmp/full-discovery.log >&2)
+
+      - name: Validate complete discovery result
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          payload = json.loads(Path('/tmp/full-discovery.json').read_text())
+          assert isinstance(payload, list), type(payload)
+          assert len(payload) == 27, f'Expected 27 non-YouTube sources, got {len(payload)}'
+
+          errors = [item for item in payload if item.get('error')]
+          with_candidates = [item for item in payload if item.get('candidates')]
+          candidate_count = sum(len(item.get('candidates', [])) for item in payload)
+          camera_count = sum(len(item.get('cameras', [])) for item in payload)
+
+          assert with_candidates, 'The full workbook run completed but discovered no HLS candidates at all'
+
+          print(f'sources_total={len(payload)}')
+          print(f'sources_with_candidates={len(with_candidates)}')
+          print(f'sources_with_errors={len(errors)}')
+          print(f'hls_candidates_total={candidate_count}')
+          print(f'logical_cameras_total={camera_count}')
+
+          if errors:
+              print('Sources with errors:')
+              for item in errors:
+                  source = item.get('source') or {}
+                  print(f"- {source.get('id')} {source.get('place')}: {item.get('error')}")
+          PY
+
+      - name: Print compact source summary
+        if: always()
+        shell: bash
+        run: |
+          if [ -s /tmp/full-discovery.json ]; then
+            python - <<'PY'
+          import json
+          from pathlib import Path
+
+          payload = json.loads(Path('/tmp/full-discovery.json').read_text())
+          for item in payload:
+              source = item.get('source') or {}
+              print(
+                  f"{source.get('id')} | {source.get('country')} | {source.get('city')} | "
+                  f"{source.get('place')} | candidates={len(item.get('candidates', []))} | "
+                  f"cameras={len(item.get('cameras', []))} | error={item.get('error') or '-'}"
+              )
+          PY
+          fi
+
+      - name: Upload full discovery diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stream-recorder-full-discovery
+          if-no-files-found: warn
+          path: |
+            /tmp/full-discovery.json
+            /tmp/full-discovery.log
