@@ -19,6 +19,9 @@ class AssetIdentity:
 def identify_asset(*, index_root: Path, source_path: Path) -> AssetIdentity:
     """Return a deterministic asset ID from canonical path and filesystem revision metadata."""
     root = Path(index_root).resolve(strict=True)
+    if not root.is_dir():
+        raise ValueError("indexing root must reference a directory")
+
     source = Path(source_path).resolve(strict=True)
     if not source.is_file():
         raise ValueError("source path must reference a file")
