@@ -1,5 +1,7 @@
 import asyncio
+from types import SimpleNamespace
 
+import httpx
 import pytest
 
 from scripts.stream_recorder import hls
@@ -26,6 +28,55 @@ def test_choose_best_stream_prefers_highest_resolution_then_bandwidth():
     """Variant selection prioritizes pixels before bandwidth."""
     variants = parse_master_playlist(MASTER, "https://origin.example/live/master.m3u8")
     assert choose_best_stream(variants).resolution == (1920, 1080)
+
+
+@pytest.mark.asyncio
+async def test_resolve_candidate_retries_only_certificate_failures_without_tls_verification(monkeypatch):
+    """A discovered HLS URL with a broken certificate gets one narrowly scoped insecure retry."""
+    url = "https://online2.kamery24.org/cam/debica.m3u8"
+    secure_client = object()
+    insecure_client = object()
+    fetch_clients: list[object] = []
+    async_client_kwargs: list[dict[str, object]] = []
+
+    async def fake_fetch_text(_url: str, *, client=None, **_kwargs):
+        """Fail certificate verification once, then return a media playlist via the insecure client."""
+        fetch_clients.append(client)
+        if client is secure_client:
+            raise httpx.ConnectError("[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed")
+        assert client is insecure_client
+        return "#EXTM3U\n#EXTINF:4,\nsegment.ts\n", url
+
+    class FakeAsyncClient:
+        """Model the one temporary client created with certificate verification disabled."""
+
+        def __init__(self, **kwargs) -> None:
+            """Capture construction options so the retry stays narrowly scoped."""
+            async_client_kwargs.append(kwargs)
+
+        async def __aenter__(self):
+            """Return the synthetic insecure HTTP client."""
+            return insecure_client
+
+        async def __aexit__(self, _exc_type, _exc, _tb) -> None:
+            """Close the synthetic client."""
+            return None
+
+    monkeypatch.setattr(hls, "fetch_text", fake_fetch_text)
+    monkeypatch.setattr(
+        hls,
+        "httpx",
+        SimpleNamespace(AsyncClient=FakeAsyncClient, ConnectError=httpx.ConnectError),
+        raising=False,
+    )
+
+    stream, variants = await hls.resolve_candidate(url, client=secure_client)
+
+    assert stream.url == url
+    assert variants == set()
+    assert fetch_clients == [secure_client, insecure_client]
+    assert len(async_client_kwargs) == 1
+    assert async_client_kwargs[0]["verify"] is False
 
 
 @pytest.mark.asyncio
