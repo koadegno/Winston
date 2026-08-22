@@ -97,7 +97,7 @@ async def _discover_http_source(
     *,
     client: Any,
 ) -> tuple[int, set[str], BaseException | None]:
-    """Run stage-1 HTTP discovery for one workbook source."""
+    """Run stage-1 HTTP discovery for one configured source."""
     try:
         streams = await discover_http(
             source.url,
@@ -115,7 +115,7 @@ async def _discover_browser_source(
     *,
     browser: BrowserSession,
 ) -> tuple[int, set[str]]:
-    """Run stage-2 one-page browser discovery for one workbook source."""
+    """Run stage-2 one-page browser discovery for one configured source."""
     streams = await discover_browser(
         source.url,
         browser=browser,
@@ -150,10 +150,10 @@ async def _discover_xlsb(
     resolve: bool,
     browser_concurrency: int = DEFAULT_BROWSER_CONCURRENCY,
 ) -> list[dict[str, object]]:
-    """Discover all workbook sources in explicit HTTP, browser, and HLS stages."""
+    """Discover all configured sources in explicit HTTP, browser, and HLS stages."""
     sources = load_sources(path)
     log(
-        f"[discover] loaded {len(sources)} non-YouTube source(s); "
+        f"[discover] loaded {len(sources)} enabled non-YouTube source(s) from {path}; "
         f"browser tabs={browser_concurrency}"
     )
     if not sources:
@@ -279,7 +279,7 @@ async def _record_sources(
 ) -> None:
     """Start all source recorders with shared async HTTP and bounded Playwright resources."""
     if not sources:
-        raise RuntimeError("No non-YouTube sources found")
+        raise RuntimeError("No enabled non-YouTube sources found")
 
     log(
         f"[record] scheduling {len(sources)} sources; "
@@ -331,7 +331,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     target = discover.add_mutually_exclusive_group(required=True)
     target.add_argument("--url")
-    target.add_argument("--xlsb", type=Path)
+    target.add_argument(
+        "--sources",
+        "--xlsb",
+        dest="sources",
+        type=Path,
+        help="CSV source list (preferred) or legacy XLSB workbook.",
+    )
     discover.add_argument(
         "--no-browser",
         action="store_true",
@@ -346,9 +352,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     record = subparsers.add_parser(
         "record",
-        help="Record all non-YouTube sources from Place_Overview.xlsb.",
+        help="Record all enabled non-YouTube sources from the configured source list.",
     )
-    record.add_argument("--xlsb", type=Path, required=True)
+    record.add_argument(
+        "--sources",
+        "--xlsb",
+        dest="sources",
+        type=Path,
+        required=True,
+        help="CSV source list (preferred) or legacy XLSB workbook.",
+    )
     record.add_argument(
         "--output",
         type=Path,
@@ -380,7 +393,7 @@ async def main(argv: Sequence[str] | None = None) -> int:
             )
         else:
             payload = await _discover_xlsb(
-                args.xlsb,
+                args.sources,
                 use_browser=use_browser,
                 resolve=resolve,
                 browser_concurrency=args.browser_concurrency,
@@ -388,7 +401,7 @@ async def main(argv: Sequence[str] | None = None) -> int:
         print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
         return 0
 
-    sources = load_sources(args.xlsb)
+    sources = load_sources(args.sources)
     if args.source_id:
         selected = set(args.source_id)
         sources = [source for source in sources if source.id in selected]
