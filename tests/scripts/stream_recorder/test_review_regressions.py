@@ -130,6 +130,75 @@ async def test_browser_observes_frame_tree_without_reopening_iframe_urls() -> No
 
 
 @pytest.mark.asyncio
+async def test_real_browser_session_uses_isolated_context_per_source() -> None:
+    """Concurrent sources share one Chromium process but never share browser session state."""
+    contexts_created = 0
+    contexts_closed = 0
+    active_contexts = 0
+    max_active_contexts = 0
+
+    class Page:
+        """Model one source tab living inside its own BrowserContext."""
+
+        frames: list[object] = []
+
+        def on(self, _event: str, _callback) -> None:
+            """Accept request listeners without emitting HLS."""
+            return None
+
+        async def goto(self, _url: str, **_kwargs) -> None:
+            """Keep sources overlapped long enough to exercise the semaphore."""
+            await asyncio.sleep(0.02)
+
+        async def close(self) -> None:
+            """Close the source tab immediately."""
+            return None
+
+    class Context:
+        """Represent one isolated source session created by the shared Chromium process."""
+
+        async def new_page(self) -> Page:
+            """Create the only page used by this isolated source context."""
+            return Page()
+
+        async def close(self) -> None:
+            """Release this source session and update concurrency accounting."""
+            nonlocal contexts_closed, active_contexts
+            contexts_closed += 1
+            active_contexts -= 1
+
+    class Browser:
+        """Create isolated contexts while representing one shared Chromium process."""
+
+        async def new_context(self) -> Context:
+            """Create a new isolated source context and track concurrent context count."""
+            nonlocal contexts_created, active_contexts, max_active_contexts
+            contexts_created += 1
+            active_contexts += 1
+            max_active_contexts = max(max_active_contexts, active_contexts)
+            return Context()
+
+    session = discovery.BrowserSession(
+        context=None,
+        browser=Browser(),
+        page_semaphore=asyncio.Semaphore(2),
+    )
+
+    await asyncio.gather(*(
+        discovery._visit_browser_target(
+            session,
+            f"https://example.test/source-{index}",
+            settle_ms=0,
+        )
+        for index in range(4)
+    ))
+
+    assert contexts_created == 4
+    assert contexts_closed == 4
+    assert max_active_contexts == 2
+
+
+@pytest.mark.asyncio
 async def test_concurrent_camera_rediscovery_is_coalesced_per_source(monkeypatch) -> None:
     """Camera failures from one source must await one shared in-flight rediscovery."""
     source = Source("1", "Square", "City", "Country", "https://example.test/page")
