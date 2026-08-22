@@ -8,7 +8,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 import re
 import time
-from typing import Any
+from typing import Any, TypeVar
 from urllib.parse import urljoin, urlparse
 
 import httpx
@@ -45,6 +45,12 @@ _BLOCKED_STREAM_HOST_SUFFIXES = (
     "youtu.be",
     "googlevideo.com",
 )
+
+_T = TypeVar("_T")
+
+
+class _BoundedOperationTimeout(TimeoutError):
+    """Signal that an awaitable exceeded a wall-clock deadline without awaiting cancellation."""
 
 
 @dataclass(slots=True)
@@ -89,13 +95,15 @@ class BrowserSession:
                 return
 
             try:
-                new_browser = await asyncio.wait_for(
+                new_browser = await _await_bounded(
                     self.browser_type.launch(headless=True),
-                    timeout=DEFAULT_BROWSER_SHUTDOWN_TIMEOUT_SECONDS,
+                    timeout_seconds=DEFAULT_BROWSER_SHUTDOWN_TIMEOUT_SECONDS,
+                    operation="Chromium restart",
                 )
-                new_context = await asyncio.wait_for(
+                new_context = await _await_bounded(
                     new_browser.new_context(),
-                    timeout=DEFAULT_BROWSER_SHUTDOWN_TIMEOUT_SECONDS,
+                    timeout_seconds=DEFAULT_BROWSER_SHUTDOWN_TIMEOUT_SECONDS,
+                    operation="browser context restart",
                 )
             except Exception as exc:
                 self.failed = f"browser restart failed: {type(exc).__name__}: {exc}"
@@ -236,16 +244,62 @@ async def discover_http(
     return streams
 
 
+def _consume_background_task(task: asyncio.Task[Any]) -> None:
+    """Consume a detached task result so abandoned Playwright calls do not emit warnings."""
+    if task.cancelled():
+        return
+    try:
+        task.exception()
+    except BaseException:
+        # Detached transport calls are diagnostic cleanup only after the caller timed out.
+        return
+
+
+async def _await_bounded(
+    awaitable: Awaitable[_T],
+    *,
+    timeout_seconds: float,
+    operation: str,
+) -> _T:
+    """Await an operation for a wall-clock bound without waiting for cancellation cooperation."""
+    if timeout_seconds <= 0:
+        raise _BoundedOperationTimeout(f"{operation} deadline exhausted")
+
+    task = asyncio.ensure_future(awaitable)
+    done, _ = await asyncio.wait({task}, timeout=timeout_seconds)
+    if task not in done:
+        # Crucially, cancel but DO NOT await this task. Some Playwright transport operations can
+        # suppress/delay cancellation, which previously defeated asyncio.timeout()/wait_for().
+        task.cancel()
+        task.add_done_callback(_consume_background_task)
+        raise _BoundedOperationTimeout(
+            f"{operation} exceeded {timeout_seconds:.3f}s"
+        )
+    return task.result()
+
+
+def _remaining_seconds(deadline: float) -> float:
+    """Return remaining monotonic seconds for one hard browser-page deadline."""
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise _BoundedOperationTimeout("browser source-page deadline exhausted")
+    return remaining
+
+
 async def _run_cleanup_bounded(
     action: Callable[[], Awaitable[Any]],
     label: str,
     *,
     timeout_seconds: float,
 ) -> bool:
-    """Run one asynchronous cleanup action with a strict deadline."""
+    """Run one asynchronous cleanup action without waiting for cancellation cooperation."""
     try:
-        await asyncio.wait_for(action(), timeout=timeout_seconds)
-    except TimeoutError:
+        await _await_bounded(
+            action(),
+            timeout_seconds=timeout_seconds,
+            operation=label,
+        )
+    except _BoundedOperationTimeout:
         log(f"[browser] WARN {label} timeout after {timeout_seconds:.1f}s")
         return False
     except Exception as exc:
@@ -297,7 +351,7 @@ async def _visit_browser_target(
     close_timeout_seconds: float = DEFAULT_BROWSER_PAGE_CLOSE_TIMEOUT_SECONDS,
     label: str | None = None,
 ) -> set[str]:
-    """Observe one source page/frame tree with one bounded Playwright tab."""
+    """Observe one source page/frame tree with a non-cooperative hard wall-clock deadline."""
     if hard_timeout_ms < 1:
         raise ValueError("hard_timeout_ms must be at least 1")
     if close_timeout_seconds <= 0:
@@ -318,54 +372,81 @@ async def _visit_browser_target(
         streams: set[str] = set()
         stream_seen = asyncio.Event()
         started = time.monotonic()
+        deadline = started + (hard_timeout_ms / 1000)
         try:
-            async with asyncio.timeout(hard_timeout_ms / 1000):
-                if session.context is None:
-                    raise RuntimeError("browser context is unavailable")
-                page = await session.context.new_page()
-                log(f"{prefix} open {url}")
+            if session.context is None:
+                raise RuntimeError("browser context is unavailable")
+            page = await _await_bounded(
+                session.context.new_page(),
+                timeout_seconds=_remaining_seconds(deadline),
+                operation=f"new page {url}",
+            )
+            log(f"{prefix} open {url}")
 
-                def collect(request: Any) -> None:
-                    """Capture only allowed HLS requests from the whole page/frame tree."""
-                    candidate = request.url
-                    if not is_allowed_hls_url(candidate):
-                        return
-                    if candidate not in streams:
-                        log(f"{prefix} HLS {candidate}")
-                    streams.add(candidate)
-                    stream_seen.set()
+            def collect(request: Any) -> None:
+                """Capture only allowed HLS requests from the whole page/frame tree."""
+                candidate = request.url
+                if not is_allowed_hls_url(candidate):
+                    return
+                if candidate not in streams:
+                    log(f"{prefix} HLS {candidate}")
+                streams.add(candidate)
+                stream_seen.set()
 
-                page.on("request", collect)
-                try:
-                    await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
-                except Exception as exc:
-                    # A navigation timeout/error can still leave a usable player that emitted HLS.
-                    log(f"{prefix} navigation warning: {type(exc).__name__}: {exc}")
+            page.on("request", collect)
+            navigation_bound = min(
+                timeout_ms / 1000,
+                _remaining_seconds(deadline),
+            )
+            try:
+                await _await_bounded(
+                    page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms),
+                    timeout_seconds=navigation_bound,
+                    operation=f"navigation {url}",
+                )
+            except _BoundedOperationTimeout:
+                raise
+            except Exception as exc:
+                # A Playwright navigation error can still leave a usable player that emitted HLS.
+                log(f"{prefix} navigation warning: {type(exc).__name__}: {exc}")
+            else:
+                log(f"{prefix} loaded {url}")
+
+            if session.generation != generation:
+                raise RuntimeError("browser was recycled during page visit")
+
+            if settle_ms > 0:
+                remaining = _remaining_seconds(deadline)
+                if streams:
+                    await asyncio.sleep(
+                        min(settle_ms / 1000, _BROWSER_STREAM_GRACE_MS / 1000, remaining)
+                    )
                 else:
-                    log(f"{prefix} loaded {url}")
-
-                if session.generation != generation:
-                    raise RuntimeError("browser was recycled during page visit")
-
-                if settle_ms > 0:
-                    if streams:
-                        await page.wait_for_timeout(min(settle_ms, _BROWSER_STREAM_GRACE_MS))
+                    wait_seconds = min(settle_ms / 1000, remaining)
+                    try:
+                        await asyncio.wait_for(stream_seen.wait(), timeout=wait_seconds)
+                    except TimeoutError:
+                        pass
                     else:
-                        try:
-                            await asyncio.wait_for(stream_seen.wait(), timeout=settle_ms / 1000)
-                        except TimeoutError:
-                            pass
-                        else:
-                            await page.wait_for_timeout(min(settle_ms, _BROWSER_STREAM_GRACE_MS))
+                        remaining = _remaining_seconds(deadline)
+                        await asyncio.sleep(
+                            min(
+                                settle_ms / 1000,
+                                _BROWSER_STREAM_GRACE_MS / 1000,
+                                remaining,
+                            )
+                        )
 
-                elapsed = time.monotonic() - started
-                log(f"{prefix} done in {elapsed:.1f}s: {len(streams)} HLS candidate(s)")
-                return streams
-        except TimeoutError:
+            # Ensure the settle window itself did not consume the last fraction of the deadline.
+            _remaining_seconds(deadline)
+            elapsed = time.monotonic() - started
+            log(f"{prefix} done in {elapsed:.1f}s: {len(streams)} HLS candidate(s)")
+            return streams
+        except _BoundedOperationTimeout as exc:
             elapsed = time.monotonic() - started
             log(
                 f"{prefix} HARD TIMEOUT after {elapsed:.1f}s "
-                f"(limit={hard_timeout_ms / 1000:.1f}s): {url}"
+                f"(limit={hard_timeout_ms / 1000:.1f}s): {url} ({exc})"
             )
             raise
         finally:
@@ -408,13 +489,15 @@ async def browser_session(
     playwright = await manager.start()
     session: BrowserSession | None = None
     try:
-        browser = await asyncio.wait_for(
+        browser = await _await_bounded(
             playwright.chromium.launch(headless=True),
-            timeout=DEFAULT_BROWSER_SHUTDOWN_TIMEOUT_SECONDS,
+            timeout_seconds=DEFAULT_BROWSER_SHUTDOWN_TIMEOUT_SECONDS,
+            operation="Chromium launch",
         )
-        context = await asyncio.wait_for(
+        context = await _await_bounded(
             browser.new_context(),
-            timeout=DEFAULT_BROWSER_SHUTDOWN_TIMEOUT_SECONDS,
+            timeout_seconds=DEFAULT_BROWSER_SHUTDOWN_TIMEOUT_SECONDS,
+            operation="browser context creation",
         )
         session = BrowserSession(
             context=context,
