@@ -1,0 +1,150 @@
+name: Stream recorder
+
+on:
+  push:
+    branches:
+      - feat/public-stream-recorder
+    paths:
+      - 'scripts/stream_recorder/**'
+      - 'tests/scripts/stream_recorder/**'
+      - 'Place_Overview.csv'
+      - 'pyproject.toml'
+      - 'uv.lock'
+      - '.github/workflows/stream-recorder.yml'
+  pull_request:
+    paths:
+      - 'scripts/stream_recorder/**'
+      - 'tests/scripts/stream_recorder/**'
+      - 'Place_Overview.csv'
+      - 'pyproject.toml'
+      - 'uv.lock'
+      - '.github/workflows/stream-recorder.yml'
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install project and script dependencies
+        run: python -m pip install -e '.[script]'
+      - name: Run unit and local integration tests
+        run: python -m pytest tests/scripts/stream_recorder -q
+      - name: Install Chromium
+        run: python -m playwright install --with-deps chromium
+
+      - name: Discover Brussels and Prijedor HLS webcams
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          timeout 90s python -m scripts.stream_recorder.main discover \
+            --url 'https://www.brussels.be/webcam-grand-place' \
+            --candidates-only \
+            > /tmp/brussels.json &
+          brussels_pid=$!
+
+          timeout 90s python -m scripts.stream_recorder.main discover \
+            --url 'https://www.prijedorgrad.org/sr-BA/gradsko-oko-live.html' \
+            --candidates-only \
+            > /tmp/prijedor.json &
+          prijedor_pid=$!
+
+          wait "$brussels_pid"
+          wait "$prijedor_pid"
+
+          cat /tmp/brussels.json
+          cat /tmp/prijedor.json
+
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          from urllib.parse import urlparse
+
+          brussels = json.loads(Path('/tmp/brussels.json').read_text())['candidates']
+          prijedor = json.loads(Path('/tmp/prijedor.json').read_text())['candidates']
+
+          assert brussels, 'No .m3u8 candidate discovered from Brussels Grand Place'
+          assert any(urlparse(url).hostname == 'livecam.brucity.be' for url in brussels), brussels
+
+          ipcamlive = {
+              url for url in prijedor
+              if (urlparse(url).hostname or '').endswith('ipcamlive.com')
+          }
+          assert len(ipcamlive) >= 2, prijedor
+
+          print(f'brussels_m3u8={len(brussels)}')
+          print(f'prijedor_ipcamlive_m3u8={len(ipcamlive)}')
+          PY
+
+      - name: Verify Czersk and Debica real targets
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          timeout 90s python -m scripts.stream_recorder.main discover \
+            --url 'https://czersk.pl/strona/552-kamera-line' \
+            --candidates-only \
+            > /tmp/czersk.json &
+          czersk_pid=$!
+
+          timeout 90s python -m scripts.stream_recorder.main discover \
+            --url 'https://www.kamery24.org/i24/index.php/test/82-debica-rynek' \
+            > /tmp/debica.json &
+          debica_pid=$!
+
+          wait "$czersk_pid"
+          wait "$debica_pid"
+
+          cat /tmp/czersk.json
+          cat /tmp/debica.json
+
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          czersk = json.loads(Path('/tmp/czersk.json').read_text())
+          debica = json.loads(Path('/tmp/debica.json').read_text())
+
+          czersk_url = 'https://7005.szczecin.pl/camss/streams/czersk.m3u8'
+          debica_url = 'https://online2.kamery24.org/cam/debica.m3u8'
+
+          assert czersk_url in czersk['candidates'], czersk
+          assert debica_url in debica['candidates'], debica
+          assert debica['cameras'], debica
+
+          print(f"czersk_m3u8={len(czersk['candidates'])}")
+          print(f"debica_cameras={len(debica['cameras'])}")
+          PY
+
+      - name: Verify Boccadasse through the normal recorder discovery path
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          timeout 90s python -m scripts.stream_recorder.main discover \
+            --url 'https://www.skylinewebcams.com/en/webcam/italia/liguria/genova/boccadasse-genova.html' \
+            > /tmp/boccadasse.json
+
+          cat /tmp/boccadasse.json
+
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          from urllib.parse import urlparse
+
+          payload = json.loads(Path('/tmp/boccadasse.json').read_text())
+          candidates = payload['candidates']
+          assert any(
+              urlparse(url).hostname == 'hd-auth.skylinewebcams.com'
+              for url in candidates
+          ), payload
+          assert payload['cameras'], payload
+
+          print(f"boccadasse_candidates={len(candidates)}")
+          print(f"boccadasse_cameras={len(payload['cameras'])}")
+          PY
