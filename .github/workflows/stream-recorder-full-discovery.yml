@@ -8,7 +8,7 @@ on:
       - '.github/workflows/stream-recorder-full-discovery.yml'
       - 'scripts/stream_recorder/**'
       - 'tests/scripts/stream_recorder/**'
-      - 'Place_Overview.xlsb'
+      - 'Place_Overview.csv'
       - 'pyproject.toml'
       - 'uv.lock'
   pull_request:
@@ -18,7 +18,7 @@ on:
       - '.github/workflows/stream-recorder-full-discovery.yml'
       - 'scripts/stream_recorder/**'
       - 'tests/scripts/stream_recorder/**'
-      - 'Place_Overview.xlsb'
+      - 'Place_Overview.csv'
       - 'pyproject.toml'
       - 'uv.lock'
   workflow_dispatch:
@@ -47,21 +47,22 @@ jobs:
       - name: Install Chromium
         run: python -m playwright install --with-deps chromium
 
-      - name: Verify repository Place Overview workbook
+      - name: Verify repository Place Overview CSV
         shell: bash
         run: |
           set -euo pipefail
-          test -f Place_Overview.xlsb
-          ls -lh Place_Overview.xlsb
+          test -f Place_Overview.csv
+          wc -l Place_Overview.csv
+          head -n 2 Place_Overview.csv
 
-      - name: Discover every non-YouTube source from the workbook
+      - name: Discover every enabled non-YouTube source from the CSV
         shell: bash
         run: |
           set -euo pipefail
 
           started=$(date +%s)
           timeout 10m python -m scripts.stream_recorder.main discover \
-            --xlsb Place_Overview.xlsb \
+            --sources Place_Overview.csv \
             --browser-concurrency 4 \
             > /tmp/full-discovery.json \
             2> >(tee /tmp/full-discovery.log >&2)
@@ -80,7 +81,12 @@ jobs:
 
           payload = json.loads(Path('/tmp/full-discovery.json').read_text())
           assert isinstance(payload, list), type(payload)
-          assert len(payload) == 27, f'Expected 27 non-YouTube sources, got {len(payload)}'
+          assert len(payload) == 34, f'Expected 34 enabled non-YouTube sources, got {len(payload)}'
+
+          by_id = {str((item.get('source') or {}).get('id')): item for item in payload}
+          assert '61' not in by_id, 'Sittard must stay disabled while its player is YouTube-backed'
+          for source_id in ('90-1', '90-2', '90-3', '90-4', '90-5', '90-6', '131', '132', '133'):
+              assert source_id in by_id, f'Missing configured source {source_id}'
 
           errors = [item for item in payload if item.get('error')]
           with_candidates = [item for item in payload if item.get('candidates')]
@@ -111,14 +117,28 @@ jobs:
               return any(host == suffix or host.endswith('.' + suffix) for suffix in blocked_suffixes)
 
           blocked_urls = [url for url in candidate_urls if blocked(url)]
-          assert with_candidates, 'The full workbook run discovered no HLS candidates'
+          assert with_candidates, 'The full CSV run discovered no HLS candidates'
           assert not blocked_urls, f'Blocked service URLs leaked into HLS candidates: {blocked_urls}'
+
+          czersk_url = 'https://7005.szczecin.pl/camss/streams/czersk.m3u8'
+          debica_url = 'https://online2.kamery24.org/cam/debica.m3u8'
+          assert czersk_url in by_id['112'].get('candidates', []), by_id['112']
+          assert debica_url in by_id['113'].get('candidates', []), by_id['113']
+          assert by_id['113'].get('cameras'), by_id['113']
 
           print(f'sources_total={len(payload)}')
           print(f'sources_with_candidates={len(with_candidates)}')
           print(f'sources_with_errors={len(errors)}')
           print(f'hls_candidates_total={len(candidate_urls)}')
           print(f'logical_cameras_total={camera_count}')
+
+          print('New source coverage:')
+          for source_id in ('90-1', '90-2', '90-3', '90-4', '90-5', '90-6', '131', '132', '133'):
+              item = by_id[source_id]
+              print(
+                  f"- {source_id}: candidates={len(item.get('candidates', []))} "
+                  f"cameras={len(item.get('cameras', []))} error={item.get('error') or '-'}"
+              )
 
           if errors:
               print('Sources with errors:')
