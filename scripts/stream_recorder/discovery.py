@@ -170,6 +170,10 @@ def _extract_hls_token(text: str, marker_start: int) -> str:
 
     raw = _normalize_escaped_url(text[left:right]).strip()
     lowered = raw.lower()
+    # URL-encoded absolute URLs commonly appear as telemetry/query metadata. Static
+    # extraction must not turn those values into fake relative HLS resources.
+    if lowered.startswith(("http%3a%2f%2f", "https%3a%2f%2f")):
+        return ""
     http_position = max(lowered.rfind("https://"), lowered.rfind("http://"))
     if http_position >= 0:
         # JavaScript can prefix an unquoted URL with a label such as ``src:https://...``.
@@ -183,7 +187,10 @@ def is_allowed_hls_url(url: str) -> bool:
     host = (parsed.hostname or "").lower()
     if parsed.scheme not in {"http", "https"} or not host:
         return False
-    if _HLS_MARKER not in url.lower():
+    # The requested resource itself must be an HLS playlist. Telemetry endpoints can
+    # legitimately contain an encoded ``.m3u8`` URL in their query string, but that
+    # does not make the telemetry request an HLS candidate.
+    if not parsed.path.lower().endswith(_HLS_MARKER):
         return False
     return not any(_host_matches_suffix(host, suffix) for suffix in _BLOCKED_STREAM_HOST_SUFFIXES)
 
