@@ -1,0 +1,75 @@
+name: Apply stream recorder clean-miss retry
+
+on:
+  push:
+    branches:
+      - feat/public-stream-recorder
+    paths:
+      - '.github/workflows/apply-stream-recorder-clean-retry.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feat/public-stream-recorder
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Patch clean empty browser retry
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path('scripts/stream_recorder/discovery.py')
+          text = path.read_text()
+          old = '''        log(f"{prefix} discovery done: {len(streams)} HLS candidate(s)")
+          return streams
+
+      return set()
+          '''
+          new = '''        if streams:
+              log(f"{prefix} discovery done: {len(streams)} HLS candidate(s)")
+              return streams
+          if attempt == 0:
+              # Some third-party players occasionally initialize without starting their HLS request.
+              # A second visit gets a fresh isolated browser context while keeping the retry bounded.
+              log(f"{prefix} clean miss; retrying once in a fresh source context")
+              continue
+          log(f"{prefix} discovery done: 0 HLS candidate(s) after one clean retry")
+          return set()
+
+      return set()
+          '''
+          if old not in text:
+              raise SystemExit('expected discover_browser block not found')
+          path.write_text(text.replace(old, new, 1))
+          PY
+
+      - name: Install project dependencies
+        run: python -m pip install -e '.[script]'
+
+      - name: Verify targeted RED is now GREEN
+        run: python -m pytest tests/scripts/stream_recorder/test_review_regressions.py::test_browser_retries_one_clean_empty_visit_in_fresh_source_context -q
+
+      - name: Verify complete stream recorder tests
+        run: python -m pytest tests/scripts/stream_recorder -q
+
+      - name: Commit implementation
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add scripts/stream_recorder/discovery.py
+          git commit -m 'fix: retry clean browser misses once'
+          git push origin HEAD:feat/public-stream-recorder
