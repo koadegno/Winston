@@ -46,3 +46,5 @@ id,place,city,country,url,description,enabled,disabled_reason
 131,Playa del Sardinero,Santander,Spain,https://www.skylinewebcams.com/en/webcam/espana/cantabria/santander/playa-del-sardinero.html,,true,
 132,Sutton Coldfield,Birmingham,UK,https://www.skylinewebcams.com/en/webcam/united-kingdom/england/birmingham/sutton-coldfield.html,,true,
 133,Boccadasse,Genoa,Italy,https://www.skylinewebcams.com/en/webcam/italia/liguria/genova/boccadasse-genova.html,,true,
+134,Grand Place,Brussels,Belgium,https://www.bruxelles.be/webcam-grand-place,,true,
+135,Place de Brouckere,Brussels,Belgium,https://www.bruxelles.be/webcam-place-de-brouckere,,true,
