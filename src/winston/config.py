@@ -45,6 +45,15 @@ class JinaApiEmbeddingSettings(BaseSettings):
     max_concurrency: PositiveInt = 2
 
 
+class QdrantSettings(BaseSettings):
+    """Settings for Winston's Qdrant visual index backend."""
+
+    url: str = "http://localhost:6333"
+    collection: str = "winston_visual"
+    vector_name: str = "visual"
+    upsert_batch_size: PositiveInt = 256
+
+
 # The engine field is the discriminator, so provider-specific settings cannot be mixed together.
 type EmbeddingSettings = Annotated[
     JinaLocalEmbeddingSettings | JinaApiEmbeddingSettings,
@@ -65,6 +74,7 @@ class Settings(BaseSettings):
     ffmpeg_binary: str = "ffmpeg"
     ffprobe_binary: str = "ffprobe"
     embedding: EmbeddingSettings = Field(default_factory=JinaLocalEmbeddingSettings)
+    qdrant: QdrantSettings = Field(default_factory=QdrantSettings)
 
 
 def get_config() -> Settings:

@@ -9,6 +9,7 @@ from winston.config import (
     JinaApiEmbeddingSettings,
     JinaLocalEmbeddingSettings,
     LocalBackend,
+    QdrantSettings,
     Settings,
     get_config,
 )
@@ -85,3 +86,34 @@ def test_embedding_settings_reject_unknown_local_backend() -> None:
     """Unknown local backend identifiers must be rejected while settings are parsed."""
     with pytest.raises(ValidationError):
         Settings(embedding={"engine": "jina-local", "backend": "metal-magic"})
+
+
+def test_qdrant_settings_have_safe_defaults() -> None:
+    """Qdrant configuration must expose the Phase 1D defaults as one typed object."""
+    configured = Settings()
+    assert isinstance(configured.qdrant, QdrantSettings)
+    assert configured.qdrant.url == "http://localhost:6333"
+    assert configured.qdrant.collection == "winston_visual"
+    assert configured.qdrant.vector_name == "visual"
+    assert configured.qdrant.upsert_batch_size == 256
+
+
+def test_qdrant_settings_read_nested_environment_overrides(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Nested environment variables must configure Qdrant without free-form parsing elsewhere."""
+    monkeypatch.setenv("QDRANT__URL", "http://qdrant.internal:6333")
+    monkeypatch.setenv("QDRANT__COLLECTION", "custom_visual")
+    monkeypatch.setenv("QDRANT__VECTOR_NAME", "image")
+    monkeypatch.setenv("QDRANT__UPSERT_BATCH_SIZE", "32")
+    configured = get_config()
+    assert configured.qdrant.url == "http://qdrant.internal:6333"
+    assert configured.qdrant.collection == "custom_visual"
+    assert configured.qdrant.vector_name == "image"
+    assert configured.qdrant.upsert_batch_size == 32
+
+
+def test_qdrant_settings_reject_non_positive_batch_size() -> None:
+    """Qdrant writes must always have a positive bounded batch size."""
+    with pytest.raises(ValidationError):
+        QdrantSettings(upsert_batch_size=0)
