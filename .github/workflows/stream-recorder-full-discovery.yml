@@ -126,6 +126,13 @@ jobs:
           assert debica_url in by_id['113'].get('candidates', []), by_id['113']
           assert by_id['113'].get('cameras'), by_id['113']
 
+          boccadasse_candidates = by_id['133'].get('candidates', [])
+          assert any(
+              urlparse(url).hostname == 'hd-auth.skylinewebcams.com'
+              for url in boccadasse_candidates
+          ), by_id['133']
+          assert by_id['133'].get('cameras'), by_id['133']
+
           print(f'sources_total={len(payload)}')
           print(f'sources_with_candidates={len(with_candidates)}')
           print(f'sources_with_errors={len(errors)}')
