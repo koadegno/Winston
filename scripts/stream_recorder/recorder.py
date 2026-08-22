@@ -86,10 +86,11 @@ async def record_one_hour_slice(
     process = await asyncio.create_subprocess_exec(
         *build_ffmpeg_command(stream_url, output, duration)
     )
-    log(f"[ffmpeg] pid={process.pid} recording {source_slug}/{camera_id}")
+    pid = getattr(process, "pid", "unknown")
+    log(f"[ffmpeg] pid={pid} recording {source_slug}/{camera_id}")
     returncode = await process.wait()
     log(
         f"[ffmpeg] exit {source_slug}/{camera_id}: "
-        f"pid={process.pid}, returncode={returncode}, output={output}"
+        f"pid={pid}, returncode={returncode}, output={output}"
     )
     return returncode
