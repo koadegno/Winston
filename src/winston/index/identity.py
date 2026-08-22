@@ -1,22 +1,12 @@
 """Deterministic identity helpers for indexed visual candidates."""
 
-from decimal import Decimal, ROUND_HALF_UP
-import json
 import uuid
 from uuid import UUID
 
 from winston.index.models import IndexedVisual
+from winston.utils.canonical import canonical_json, timestamp_to_microseconds
 
-MICROSECONDS_PER_SECOND = Decimal(1_000_000)
 VISUAL_IDENTITY_PREFIX = "winston:visual:v1:"
-
-
-def timestamp_to_microseconds(timestamp_seconds: float | None) -> int | None:
-    """Convert a non-negative finite timestamp to deterministic integer microseconds."""
-    if timestamp_seconds is None:
-        return None
-    value = Decimal(str(timestamp_seconds)) * MICROSECONDS_PER_SECOND
-    return int(value.quantize(Decimal("1"), rounding=ROUND_HALF_UP))
 
 
 def visual_point_id(visual: IndexedVisual) -> UUID:
@@ -34,10 +24,8 @@ def visual_point_id(visual: IndexedVisual) -> UUID:
         "x": visual.region.x,
         "y": visual.region.y,
     }
-    canonical = json.dumps(
-        material,
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=False,
-    )
+    canonical = canonical_json(material)
     return uuid.uuid5(uuid.NAMESPACE_URL, f"{VISUAL_IDENTITY_PREFIX}{canonical}")
+
+
+__all__ = ["timestamp_to_microseconds", "visual_point_id"]
