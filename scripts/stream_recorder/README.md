@@ -46,6 +46,8 @@ The recorder schedules independent I/O concurrently without allowing browser ren
 
 The browser limit is configurable with `--browser-concurrency N`. Lower it on RAM-constrained machines; increasing it can speed up discovery but each active Chromium renderer can consume hundreds of MB.
 
+Each source-page visit has a **30-second hard wall-clock limit**. Navigation itself remains capped at 10 seconds; the larger total budget leaves enough time for heavy third-party players to initialize, expose their Play control, and emit HLS after interaction without allowing one broken page to block the batch indefinitely.
+
 Playwright listens to network requests from the complete loaded frame tree. Embedded iframe URLs are **not reopened recursively**. If a third-party player does not start automatically, discovery tries a visible Play interaction inside the already loaded frame tree and only then falls back to programmatic `video.play()`.
 
 ## Progress logs
