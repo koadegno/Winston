@@ -8,6 +8,7 @@ on:
       - 'src/winston/index/**'
       - 'src/winston/indexing/**'
       - 'src/winston/ingest/identity.py'
+      - 'src/winston/ingest/probe.py'
       - 'src/winston/sampling/**'
       - 'tests/src/winston/test_cli.py'
       - 'tests/src/winston/test_config.py'
@@ -16,6 +17,7 @@ on:
       - 'tests/src/winston/ingest/test_identity.py'
       - 'tests/src/winston/sampling/test_images.py'
       - 'tests/integration/test_qdrant_visual_index.py'
+      - 'tests/integration/test_restartable_index_pipeline.py'
       - 'pyproject.toml'
       - 'uv.lock'
       - '.github/workflows/qdrant-index.yml'
@@ -53,6 +55,10 @@ jobs:
             'pytest-asyncio>=1.4.0' \
             'qdrant-client==1.18.0'
           python -m pip install -e . --no-deps
+      - name: Install FFmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
       - name: Wait for Qdrant 1.18.2
         shell: bash
         run: |
@@ -75,6 +81,9 @@ jobs:
           tests/src/winston/index
           tests/src/winston/indexing
       - name: Run real Qdrant integration tests
-        run: python -m pytest -q tests/integration/test_qdrant_visual_index.py
+        run: >-
+          python -m pytest -q
+          tests/integration/test_qdrant_visual_index.py
+          tests/integration/test_restartable_index_pipeline.py
       - name: Compile Winston source
         run: python -m compileall -q src/winston
