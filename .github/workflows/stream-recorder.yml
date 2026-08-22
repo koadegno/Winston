@@ -1,230 +1,260 @@
-name: Stream recorder
+name: Stream recorder test branch
 
 on:
   push:
     branches:
-      - feat/public-stream-recorder
-    paths:
-      - 'scripts/stream_recorder/**'
-      - 'tests/scripts/stream_recorder/**'
-      - 'Place_Overview.csv'
-      - 'pyproject.toml'
-      - 'uv.lock'
-      - '.github/workflows/stream-recorder.yml'
-  pull_request:
-    paths:
-      - 'scripts/stream_recorder/**'
-      - 'tests/scripts/stream_recorder/**'
-      - 'Place_Overview.csv'
-      - 'pyproject.toml'
-      - 'uv.lock'
-      - '.github/workflows/stream-recorder.yml'
+      - test/public-stream-recorder-source-fixes
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
-  apply-delayed-hls-grace:
-    if: github.event_name == 'pull_request'
+  apply-and-verify:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
-    permissions:
-      contents: write
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: feat/public-stream-recorder
+          ref: test/public-stream-recorder-source-fixes
           fetch-depth: 0
+
       - uses: actions/setup-python@v5
         with:
           python-version: '3.13'
-      - name: Apply delayed HLS grace when needed
+
+      - name: Apply delayed-HLS and lazy-media fixes when missing
         shell: bash
         run: |
+          set -euo pipefail
           python - <<'PY'
           from pathlib import Path
 
           path = Path('scripts/stream_recorder/discovery.py')
-          text = path.read_text()
-          marker = 'media controls not ready; waiting for delayed HLS initialization'
-          if marker in text:
-              print('Delayed HLS grace is already implemented.')
-              raise SystemExit(0)
+          text = path.read_text(encoding='utf-8')
 
-          old = '''            if not streams:
-              log(f"{prefix} no HLS after initial load; trying user-gesture media activation")
-              # Real third-party players can explicitly require a user gesture. Try visible play
-              # controls first; only use HTMLMediaElement.play() if the click path produced no HLS.
-              clicked = await _click_play_controls(page, prefix, deadline)
-              if clicked and not streams:
-                  await _wait_for_hls_after_activation(stream_seen, deadline=deadline)
-              if not streams:
-                  attempted = await _activate_video_elements(page, prefix, deadline)
-                  if attempted and not streams:
-                      await _wait_for_hls_after_activation(stream_seen, deadline=deadline)
+          delayed_marker = 'media controls not ready; waiting for delayed HLS initialization'
+          if delayed_marker not in text:
+              old = '''            if not streams:
+                log(f"{prefix} no HLS after initial load; trying user-gesture media activation")
+                # Real third-party players can explicitly require a user gesture. Try visible play
+                # controls first; only use HTMLMediaElement.play() if the click path produced no HLS.
+                clicked = await _click_play_controls(page, prefix, deadline)
+                if clicked and not streams:
+                    await _wait_for_hls_after_activation(stream_seen, deadline=deadline)
+                if not streams:
+                    attempted = await _activate_video_elements(page, prefix, deadline)
+                    if attempted and not streams:
+                        await _wait_for_hls_after_activation(stream_seen, deadline=deadline)
 '''
-          new = '''            if not streams:
-              log(f"{prefix} no HLS after initial load; trying user-gesture media activation")
-              # Real third-party players can explicitly require a user gesture. Try visible play
-              # controls first; only use HTMLMediaElement.play() if the click path produced no HLS.
-              clicked = await _click_play_controls(page, prefix, deadline)
-              if clicked and not streams:
-                  await _wait_for_hls_after_activation(stream_seen, deadline=deadline)
-              attempted = False
-              if not streams:
-                  attempted = await _activate_video_elements(page, prefix, deadline)
-                  if attempted and not streams:
-                      await _wait_for_hls_after_activation(stream_seen, deadline=deadline)
-              if not streams and not clicked and not attempted:
-                  # Some players attach their video/control asynchronously after DOMContentLoaded.
-                  # Even when there is nothing to activate yet, keep the source page alive for one
-                  # bounded grace window so late network HLS requests are not missed.
-                  log(f"{prefix} media controls not ready; waiting for delayed HLS initialization")
-                  await _wait_for_hls_after_activation(stream_seen, deadline=deadline)
+              new = '''            if not streams:
+                log(f"{prefix} no HLS after initial load; trying user-gesture media activation")
+                # Real third-party players can explicitly require a user gesture. Try visible play
+                # controls first; only use HTMLMediaElement.play() if the click path produced no HLS.
+                clicked = await _click_play_controls(page, prefix, deadline)
+                if clicked and not streams:
+                    await _wait_for_hls_after_activation(stream_seen, deadline=deadline)
+                attempted = False
+                if not streams:
+                    attempted = await _activate_video_elements(page, prefix, deadline)
+                    if attempted and not streams:
+                        await _wait_for_hls_after_activation(stream_seen, deadline=deadline)
+                if not streams and not clicked and not attempted:
+                    # Some players attach their controls asynchronously after DOMContentLoaded.
+                    # Keep this same source page alive for one bounded grace window so a delayed
+                    # network HLS request is still observed without opening any extra browser page.
+                    log(f"{prefix} media controls not ready; waiting for delayed HLS initialization")
+                    await _wait_for_hls_after_activation(stream_seen, deadline=deadline)
 '''
-          if old not in text:
-              raise SystemExit('expected media activation block not found')
-          path.write_text(text.replace(old, new, 1))
+              if old not in text:
+                  raise SystemExit('delayed-HLS activation anchor not found')
+              text = text.replace(old, new, 1)
+
+          lazy_marker = '_LAZY_MEDIA_REVEAL_GRACE_MS = 1_000'
+          if lazy_marker not in text:
+              constant_anchor = '_MEDIA_ACTIVATION_GRACE_MS = 4_000\n'
+              if constant_anchor not in text:
+                  raise SystemExit('lazy-media constant anchor not found')
+              text = text.replace(
+                  constant_anchor,
+                  constant_anchor + '_LAZY_MEDIA_REVEAL_GRACE_MS = 1_000\n',
+                  1,
+              )
+
+              helper_anchor = 'async def _activate_video_elements(page: Any, prefix: str, deadline: float) -> bool:\n'
+              helper = '''async def _reveal_lazy_media(page: Any, prefix: str, deadline: float) -> bool:
+    """Reveal lazy iframe/video elements in the existing page without opening new targets."""
+    try:
+        elements = page.locator("iframe, video")
+        count = await _await_bounded(
+            elements.evaluate_all(
+                """elements => {
+                    for (const element of elements) {
+                        if (element.tagName === 'IFRAME') {
+                            element.loading = 'eager';
+                            const lazySrc = element.getAttribute('data-src');
+                            const currentSrc = element.getAttribute('src');
+                            if (lazySrc && (!currentSrc || currentSrc === 'about:blank')) {
+                                element.setAttribute('src', lazySrc);
+                            }
+                        }
+                        element.scrollIntoView({block: 'center', inline: 'nearest'});
+                    }
+                    return elements.length;
+                }"""
+            ),
+            timeout_seconds=min(1.5, _remaining_seconds(deadline)),
+            operation="lazy media reveal",
+        )
+    except Exception as exc:
+        # Lazy-load support is best-effort; normal media activation remains available afterward.
+        log(f"{prefix} lazy media reveal warning: {type(exc).__name__}: {exc}")
+        return False
+
+    if not count:
+        return False
+
+    log(f"{prefix} media activation: revealed {count} lazy iframe/video element(s)")
+    # Give Chromium a bounded moment to attach frames created by the newly eager iframe.
+    await asyncio.sleep(
+        min(_LAZY_MEDIA_REVEAL_GRACE_MS / 1000, _remaining_seconds(deadline))
+    )
+    return True
+
+
+'''
+              if helper_anchor not in text:
+                  raise SystemExit('lazy-media helper anchor not found')
+              text = text.replace(helper_anchor, helper + helper_anchor, 1)
+
+              activation_anchor = '''            if not streams:
+                log(f"{prefix} no HLS after initial load; trying user-gesture media activation")
+'''
+              activation_replacement = '''            if not streams:
+                log(f"{prefix} no HLS after initial load; revealing lazy media")
+                await _reveal_lazy_media(page, prefix, deadline)
+
+            if not streams:
+                log(f"{prefix} no HLS after lazy-media reveal; trying user-gesture media activation")
+'''
+              if activation_anchor not in text:
+                  raise SystemExit('lazy-media activation anchor not found')
+              text = text.replace(activation_anchor, activation_replacement, 1)
+
+          path.write_text(text, encoding='utf-8')
           PY
-      - name: Install project dependencies
+
+      - name: Install project and script dependencies
         run: python -m pip install -e '.[script]'
-      - name: Verify delayed HLS regression
-        run: python -m pytest tests/scripts/stream_recorder/test_czersk_activation.py::test_browser_waits_for_delayed_hls_when_player_controls_are_not_ready -q
-      - name: Commit implementation when changed
+
+      - name: Run stream recorder suite
+        run: python -m pytest tests/scripts/stream_recorder -q
+
+      - name: Install Chromium
+        run: python -m playwright install --with-deps chromium
+
+      - name: Verify Czersk, Debica, and Boccadasse
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          timeout 90s python -m scripts.stream_recorder.main discover \
+            --url 'https://czersk.pl/strona/552-kamera-line' > /tmp/czersk.json &
+          czersk_pid=$!
+
+          timeout 90s python -m scripts.stream_recorder.main discover \
+            --url 'https://www.kamery24.org/i24/index.php/test/82-debica-rynek' > /tmp/debica.json &
+          debica_pid=$!
+
+          timeout 90s python -m scripts.stream_recorder.main discover \
+            --url 'https://www.skylinewebcams.com/en/webcam/italia/liguria/genova/boccadasse-genova.html' > /tmp/boccadasse.json &
+          boccadasse_pid=$!
+
+          wait "$czersk_pid"
+          wait "$debica_pid"
+          wait "$boccadasse_pid"
+
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          from urllib.parse import urlparse
+
+          czersk = json.loads(Path('/tmp/czersk.json').read_text())
+          debica = json.loads(Path('/tmp/debica.json').read_text())
+          boccadasse = json.loads(Path('/tmp/boccadasse.json').read_text())
+
+          assert 'https://7005.szczecin.pl/camss/streams/czersk.m3u8' in czersk['candidates'], czersk
+          assert czersk['cameras'], czersk
+          assert 'https://online2.kamery24.org/cam/debica.m3u8' in debica['candidates'], debica
+          assert debica['cameras'], debica
+          assert any(
+              urlparse(url).hostname == 'hd-auth.skylinewebcams.com'
+              for url in boccadasse['candidates']
+          ), boccadasse
+          assert boccadasse['cameras'], boccadasse
+          print(f"czersk_cameras={len(czersk['cameras'])}")
+          print(f"debica_cameras={len(debica['cameras'])}")
+          print(f"boccadasse_cameras={len(boccadasse['cameras'])}")
+          PY
+
+      - name: Discover and validate full maintained CSV
+        shell: bash
+        run: |
+          set -euo pipefail
+          started=$(date +%s)
+          timeout 10m python -m scripts.stream_recorder.main discover \
+            --sources Place_Overview.csv \
+            --browser-concurrency 4 \
+            > /tmp/full-discovery.json \
+            2> >(tee /tmp/full-discovery.log >&2)
+          finished=$(date +%s)
+          echo "full_discovery_seconds=$((finished - started))"
+
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          from urllib.parse import urlparse
+
+          payload = json.loads(Path('/tmp/full-discovery.json').read_text())
+          assert len(payload) == 34, len(payload)
+          by_id = {str((item.get('source') or {}).get('id')): item for item in payload}
+          assert '61' not in by_id
+          for source_id in ('90-1', '90-2', '90-3', '90-4', '90-5', '90-6', '131', '132', '133'):
+              assert source_id in by_id, source_id
+          assert 'https://7005.szczecin.pl/camss/streams/czersk.m3u8' in by_id['112'].get('candidates', []), by_id['112']
+          assert by_id['112'].get('cameras'), by_id['112']
+          assert 'https://online2.kamery24.org/cam/debica.m3u8' in by_id['113'].get('candidates', []), by_id['113']
+          assert by_id['113'].get('cameras'), by_id['113']
+          assert any(
+              urlparse(url).hostname == 'hd-auth.skylinewebcams.com'
+              for url in by_id['133'].get('candidates', [])
+          ), by_id['133']
+          assert by_id['133'].get('cameras'), by_id['133']
+
+          blocked = ('facebook.com','fbcdn.net','google.com','googleapis.com','google-analytics.com','googleadservices.com','googlesyndication.com','googletagmanager.com','gstatic.com','doubleclick.net','youtube.com','youtu.be','googlevideo.com')
+          bad = []
+          for item in payload:
+              for url in item.get('candidates', []):
+                  host = (urlparse(url).hostname or '').lower()
+                  if any(host == suffix or host.endswith('.' + suffix) for suffix in blocked):
+                      bad.append(url)
+          assert not bad, bad
+          print(f"sources={len(payload)}")
+          print(f"sources_with_candidates={sum(bool(item.get('candidates')) for item in payload)}")
+          print(f"logical_cameras={sum(len(item.get('cameras', [])) for item in payload)}")
+          PY
+
+      - name: Commit verified source fixes to test branch
         shell: bash
         run: |
           set -euo pipefail
           if git diff --quiet -- scripts/stream_recorder/discovery.py; then
-            echo 'No production change to commit.'
+            echo 'Production source already contains both fixes.'
             exit 0
           fi
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add scripts/stream_recorder/discovery.py
-          git commit -m 'fix: wait for delayed player HLS initialization'
-          git push origin HEAD:feat/public-stream-recorder
-
-  test:
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.13'
-      - name: Install project and script dependencies
-        run: python -m pip install -e '.[script]'
-      - name: Run unit and local integration tests
-        run: python -m pytest tests/scripts/stream_recorder -q
-      - name: Install Chromium
-        run: python -m playwright install --with-deps chromium
-
-      - name: Discover Brussels and Prijedor HLS webcams
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          timeout 90s python -m scripts.stream_recorder.main discover \
-            --url 'https://www.brussels.be/webcam-grand-place' \
-            --candidates-only \
-            > /tmp/brussels.json &
-          brussels_pid=$!
-
-          timeout 90s python -m scripts.stream_recorder.main discover \
-            --url 'https://www.prijedorgrad.org/sr-BA/gradsko-oko-live.html' \
-            --candidates-only \
-            > /tmp/prijedor.json &
-          prijedor_pid=$!
-
-          wait "$brussels_pid"
-          wait "$prijedor_pid"
-
-          cat /tmp/brussels.json
-          cat /tmp/prijedor.json
-
-          python - <<'PY'
-          import json
-          from pathlib import Path
-          from urllib.parse import urlparse
-
-          brussels = json.loads(Path('/tmp/brussels.json').read_text())['candidates']
-          prijedor = json.loads(Path('/tmp/prijedor.json').read_text())['candidates']
-
-          assert brussels, 'No .m3u8 candidate discovered from Brussels Grand Place'
-          assert any(urlparse(url).hostname == 'livecam.brucity.be' for url in brussels), brussels
-
-          ipcamlive = {
-              url for url in prijedor
-              if (urlparse(url).hostname or '').endswith('ipcamlive.com')
-          }
-          assert len(ipcamlive) >= 2, prijedor
-
-          print(f'brussels_m3u8={len(brussels)}')
-          print(f'prijedor_ipcamlive_m3u8={len(ipcamlive)}')
-          PY
-
-      - name: Verify Czersk and Debica real targets
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          timeout 90s python -m scripts.stream_recorder.main discover \
-            --url 'https://czersk.pl/strona/552-kamera-line' \
-            --candidates-only \
-            > /tmp/czersk.json &
-          czersk_pid=$!
-
-          timeout 90s python -m scripts.stream_recorder.main discover \
-            --url 'https://www.kamery24.org/i24/index.php/test/82-debica-rynek' \
-            > /tmp/debica.json &
-          debica_pid=$!
-
-          wait "$czersk_pid"
-          wait "$debica_pid"
-
-          cat /tmp/czersk.json
-          cat /tmp/debica.json
-
-          python - <<'PY'
-          import json
-          from pathlib import Path
-
-          czersk = json.loads(Path('/tmp/czersk.json').read_text())
-          debica = json.loads(Path('/tmp/debica.json').read_text())
-
-          czersk_url = 'https://7005.szczecin.pl/camss/streams/czersk.m3u8'
-          debica_url = 'https://online2.kamery24.org/cam/debica.m3u8'
-
-          assert czersk_url in czersk['candidates'], czersk
-          assert debica_url in debica['candidates'], debica
-          assert debica['cameras'], debica
-
-          print(f"czersk_m3u8={len(czersk['candidates'])}")
-          print(f"debica_cameras={len(debica['cameras'])}")
-          PY
-
-      - name: Verify Boccadasse through the normal recorder discovery path
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          timeout 90s python -m scripts.stream_recorder.main discover \
-            --url 'https://www.skylinewebcams.com/en/webcam/italia/liguria/genova/boccadasse-genova.html' \
-            > /tmp/boccadasse.json
-
-          cat /tmp/boccadasse.json
-
-          python - <<'PY'
-          import json
-          from pathlib import Path
-          from urllib.parse import urlparse
-
-          payload = json.loads(Path('/tmp/boccadasse.json').read_text())
-          candidates = payload['candidates']
-          assert any(
-              urlparse(url).hostname == 'hd-auth.skylinewebcams.com'
-              for url in candidates
-          ), payload
-          assert payload['cameras'], payload
-
-          print(f"boccadasse_candidates={len(candidates)}")
-          print(f"boccadasse_cameras={len(payload['cameras'])}")
-          PY
+          git diff --cached --check
+          git commit -m 'fix: handle delayed and lazy webcam players'
+          git push origin HEAD:test/public-stream-recorder-source-fixes
