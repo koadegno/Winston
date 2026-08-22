@@ -234,20 +234,24 @@ def _candidate_priority(url: str) -> tuple[int, int, int, str]:
     return (rank, bool(parsed.query), len(url), url)
 
 
-def _select_camera_candidates(candidate_urls: set[str]) -> list[str]:
-    """Select one representative HLS URL per inferred physical-camera family."""
+def _group_camera_candidates(candidate_urls: set[str]) -> list[list[str]]:
+    """Group observed HLS URLs into deterministic physical-camera candidate families."""
     groups: dict[str, list[str]] = {}
     for url in sorted(candidate_urls):
         groups.setdefault(_camera_family_key(url), []).append(url)
-
-    selected = [min(group, key=_candidate_priority) for group in groups.values()]
-    selected.sort()
-    if len(selected) != len(candidate_urls):
+    ordered_groups = [sorted(group, key=_candidate_priority) for group in groups.values()]
+    ordered_groups.sort(key=lambda group: group[0])
+    if len(ordered_groups) != len(candidate_urls):
         log(
             f"[hls] grouped {len(candidate_urls)} observed playlist(s) into "
-            f"{len(selected)} camera family candidate(s)"
+            f"{len(ordered_groups)} camera family candidate(s)"
         )
-    return selected
+    return ordered_groups
+
+
+def _select_camera_candidates(candidate_urls: set[str]) -> list[str]:
+    """Select one preferred HLS URL per inferred physical-camera family."""
+    return [group[0] for group in _group_camera_candidates(candidate_urls)]
 
 
 def _is_certificate_verification_error(exc: BaseException) -> bool:
@@ -313,34 +317,60 @@ async def resolve_cameras(
     candidate_urls: set[str],
     *,
     client: Any | None = None,
+    browser_observed_urls: set[str] | None = None,
 ) -> list[HlsVariant]:
-    """Resolve HLS candidates concurrently after collapsing duplicate camera families."""
-    ordered_urls = _select_camera_candidates(candidate_urls)
-    log(f"[hls] resolving {len(ordered_urls)} camera candidate playlist(s) in parallel")
+    """Resolve each camera family, preserving only failed URLs observed in live browser traffic."""
+    groups = _group_camera_candidates(candidate_urls)
+    observed = browser_observed_urls or set()
+    log(f"[hls] resolving {len(groups)} camera candidate playlist(s) in parallel")
 
-    async def resolve_one(url: str) -> tuple[HlsVariant, set[str]]:
+    async def resolve_url(url: str) -> tuple[HlsVariant, set[str]]:
         """Resolve one candidate while preserving monkeypatch-friendly optional clients."""
         if client is None:
             return await resolve_candidate(url)
         return await resolve_candidate(url, client=client)
 
-    # Different physical-camera families are independent network requests, so resolve them together.
-    results = await asyncio.gather(
-        *(resolve_one(url) for url in ordered_urls),
-        return_exceptions=True,
-    )
+    async def resolve_family(group: list[str]) -> HlsVariant | None:
+        """Resolve one camera family and use a browser-observed URL as a transient fallback."""
+        preferred = group[0]
+        retry_urls = [preferred]
+        retry_urls.extend(
+            url
+            for url in group
+            if url != preferred and url in observed
+        )
+
+        for url in retry_urls:
+            try:
+                best, _ = await resolve_url(url)
+            except Exception as exc:
+                log(f"[hls] candidate failed {url}: {type(exc).__name__}: {exc}")
+                continue
+            return best
+
+        browser_fallbacks = [url for url in group if url in observed]
+        if browser_fallbacks:
+            fallback = min(browser_fallbacks, key=_candidate_priority)
+            # A request seen in the rendered player's network is stronger evidence than a stale
+            # HTML string. Keep it so FFmpeg can attempt the stream and normal rediscovery can
+            # recover when an upstream playlist is temporarily 404/unavailable.
+            log(
+                f"[hls] WARN probe unavailable; keeping browser-observed camera candidate: "
+                f"{fallback}"
+            )
+            return HlsVariant(url=fallback)
+        return None
+
+    # Camera families are independent network operations, so resolve all families concurrently.
+    results = await asyncio.gather(*(resolve_family(group) for group in groups))
 
     cameras: list[HlsVariant] = []
     seen_stream_urls: set[str] = set()
-    for candidate_url, result in zip(ordered_urls, results, strict=True):
-        if isinstance(result, BaseException):
-            log(f"[hls] candidate failed {candidate_url}: {type(result).__name__}: {result}")
+    for result in results:
+        if result is None or result.url in seen_stream_urls:
             continue
-        best, _ = result
-        if best.url in seen_stream_urls:
-            continue
-        seen_stream_urls.add(best.url)
-        cameras.append(best)
+        seen_stream_urls.add(result.url)
+        cameras.append(result)
 
     log(f"[hls] resolved {len(cameras)} logical camera(s)")
     return cameras
