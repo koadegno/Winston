@@ -22,6 +22,31 @@ on:
   workflow_dispatch:
 
 jobs:
+  rebase:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feat/public-stream-recorder
+          fetch-depth: 0
+      - name: Rebase branch onto current main
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git fetch origin main
+          if git merge-base --is-ancestor origin/main HEAD; then
+            echo 'Branch is already based on current main.'
+            exit 0
+          fi
+          git rebase origin/main
+          git push --force-with-lease origin HEAD:feat/public-stream-recorder
+
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 15
