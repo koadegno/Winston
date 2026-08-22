@@ -189,6 +189,8 @@ async def test_browser_waits_for_delayed_hls_when_player_controls_are_not_ready(
         settle_ms=1,
         hard_timeout_ms=150,
     )
+    # Freeze the value returned by discovery; the request callback owns the live set and may fire
+    # after the function has already closed the page, which is precisely the regression under test.
     returned_streams = set(streams)
 
     if delayed_task is not None:
