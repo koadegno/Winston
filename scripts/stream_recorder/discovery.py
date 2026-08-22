@@ -6,7 +6,6 @@ import asyncio
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-import re
 import time
 from typing import Any, TypeVar
 from urllib.parse import urljoin, urlparse
@@ -26,11 +25,10 @@ DEFAULT_HTTP_CONNECTIONS = 32
 DEFAULT_HTTP_TIMEOUT_SECONDS = 10.0
 DEFAULT_HTTP_TOTAL_TIMEOUT_SECONDS = 12.0
 _BROWSER_STREAM_GRACE_MS = 750
-
-_M3U8_RE = re.compile(
-    r"(?P<url>(?:https?:)?(?:\\?/[^\s'\"<>]*)?[^\s'\"<>]*?\.m3u8(?:\?[^\s'\"<>]*)?)",
-    re.IGNORECASE,
-)
+_MAX_HLS_URL_TOKEN_LENGTH = 4096
+_HLS_MARKER = ".m3u8"
+_LEFT_URL_BOUNDARIES = frozenset(" \t\r\n'\"<>`()[]{},;=")
+_RIGHT_URL_BOUNDARIES = frozenset(" \t\r\n'\"<>`()[]{},;")
 _BLOCKED_STREAM_HOST_SUFFIXES = (
     "facebook.com",
     "fbcdn.net",
@@ -148,27 +146,59 @@ def _host_matches_suffix(host: str, suffix: str) -> bool:
     return host == suffix or host.endswith(f".{suffix}")
 
 
+def _extract_hls_token(text: str, marker_start: int) -> str:
+    """Extract one bounded URL-like token around an already located ``.m3u8`` marker."""
+    marker_end = marker_start + len(_HLS_MARKER)
+    left_limit = max(0, marker_start - _MAX_HLS_URL_TOKEN_LENGTH)
+    right_limit = min(len(text), marker_end + _MAX_HLS_URL_TOKEN_LENGTH)
+
+    left = marker_start
+    while left > left_limit and text[left - 1] not in _LEFT_URL_BOUNDARIES:
+        left -= 1
+
+    right = marker_end
+    while right < right_limit and text[right] not in _RIGHT_URL_BOUNDARIES:
+        right += 1
+
+    raw = _normalize_escaped_url(text[left:right]).strip()
+    lowered = raw.lower()
+    http_position = max(lowered.rfind("https://"), lowered.rfind("http://"))
+    if http_position >= 0:
+        # JavaScript can prefix an unquoted URL with a label such as ``src:https://...``.
+        raw = raw[http_position:]
+    return raw
+
+
 def is_allowed_hls_url(url: str) -> bool:
     """Accept HTTP(S) HLS URLs while excluding unrelated Google/Facebook/YouTube services."""
     parsed = urlparse(url)
     host = (parsed.hostname or "").lower()
     if parsed.scheme not in {"http", "https"} or not host:
         return False
-    if ".m3u8" not in url.lower():
+    if _HLS_MARKER not in url.lower():
         return False
     return not any(_host_matches_suffix(host, suffix) for suffix in _BLOCKED_STREAM_HOST_SUFFIXES)
 
 
 def extract_m3u8_urls(text: str, base_url: str) -> set[str]:
-    """Extract allowed absolute HLS playlist URLs from arbitrary HTML or JavaScript text."""
+    """Extract HLS playlist URLs in linear time without regex backtracking on large pages."""
     urls: set[str] = set()
-    for match in _M3U8_RE.finditer(text):
-        raw = _normalize_escaped_url(match.group("url")).strip()
+    lowered = text.lower()
+    cursor = 0
+    while True:
+        marker_start = lowered.find(_HLS_MARKER, cursor)
+        if marker_start < 0:
+            break
+
+        raw = _extract_hls_token(text, marker_start)
         if raw.startswith("//"):
             raw = "https:" + raw
         candidate = urljoin(base_url, raw)
         if is_allowed_hls_url(candidate):
             urls.add(candidate)
+
+        # Continue after this marker; token scanning is independently bounded to 4 KiB.
+        cursor = marker_start + len(_HLS_MARKER)
     return urls
 
 
