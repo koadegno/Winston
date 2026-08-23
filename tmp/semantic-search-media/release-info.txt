@@ -1,0 +1,5 @@
+# Releases
+Winston test dataset v1	Latest	test-dataset-v1	2026-08-23T16:57:21Z
+
+# Latest release JSON
+{"assets":[{"apiUrl":"https://api.github.com/repos/koadegno/Winston/releases/assets/526426930","contentType":"application/zip","createdAt":"2026-08-23T16:53:50Z","digest":"sha256:94fa6b655e4118401fb724736d5e21f5e34d52b677f91562af9297e4a08201b6","downloadCount":0,"id":"RA_kwDOT__Ve84fYKMy","label":"","name":"videos.zip","size":844175165,"state":"uploaded","updatedAt":"2026-08-23T16:57:19Z","url":"https://github.com/koadegno/Winston/releases/download/test-dataset-v1/videos.zip"}],"name":"Winston test dataset v1","publishedAt":"2026-08-23T16:57:21Z","tagName":"test-dataset-v1","url":"https://github.com/koadegno/Winston/releases/tag/test-dataset-v1"}
