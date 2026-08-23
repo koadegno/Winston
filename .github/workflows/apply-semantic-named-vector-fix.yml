@@ -1,0 +1,49 @@
+name: Apply semantic named-vector fix
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/apply-semantic-named-vector-fix.yml'
+  push:
+    branches:
+      - feat/semantic-search-cli
+    paths:
+      - '.github/workflows/apply-semantic-named-vector-fix.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feat/semantic-search-cli
+      - name: Apply reviewed adapter change
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path('src/winston/index/qdrant.py')
+          text = path.read_text()
+          protocol_old = '        with_vectors: bool,\n'
+          protocol_new = '        with_vectors: list[str],\n'
+          query_old = '                with_vectors=True,\n'
+          query_new = '                with_vectors=[self._settings.vector_name],\n'
+          if text.count(protocol_old) != 1:
+              raise SystemExit('expected exactly one query_points with_vectors protocol annotation')
+          if text.count(query_old) != 1:
+              raise SystemExit('expected exactly one coarse query with_vectors=True call')
+          text = text.replace(protocol_old, protocol_new).replace(query_old, query_new)
+          path.write_text(text)
+          PY
+          git rm .github/workflows/apply-semantic-named-vector-fix.yml
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add src/winston/index/qdrant.py
+          git commit -m 'fix: request only named visual vector'
+          git push origin HEAD:feat/semantic-search-cli
