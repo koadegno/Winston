@@ -21,40 +21,27 @@ jobs:
           set -euo pipefail
           python - <<'PY'
           from pathlib import Path
+          import re
 
           path = Path('src/winston/index/qdrant.py')
           text = path.read_text()
-          protocol_old = '''    async def query_points(
-              self,
-              collection_name: str,
-              *,
-              query: list[float],
-              using: str,
-              limit: int,
-              with_payload: bool,
-              with_vectors: bool,
-          ) -> models.QueryResponse:
-          '''
-          protocol_new = protocol_old.replace('with_vectors: bool,', 'with_vectors: list[str],')
-          query_old = '''            response = await self._client.query_points(
-                  self._settings.collection,
-                  query=query_vector.tolist(),
-                  using=self._settings.vector_name,
-                  limit=limit,
-                  with_payload=True,
-                  with_vectors=True,
-              )
-          '''
-          query_new = query_old.replace(
-              'with_vectors=True,',
-              'with_vectors=[self._settings.vector_name],',
+
+          text, protocol_count = re.subn(
+              r'(async def query_points\([\s\S]*?with_payload: bool,\n\s*)with_vectors: bool,',
+              r'\1with_vectors: list[str],',
+              text,
+              count=1,
           )
-          if protocol_old not in text:
-              raise SystemExit('query_points protocol block not found')
-          if query_old not in text:
-              raise SystemExit('coarse query block not found')
-          text = text.replace(protocol_old, protocol_new, 1)
-          text = text.replace(query_old, query_new, 1)
+          text, query_count = re.subn(
+              r'(response = await self\._client\.query_points\([\s\S]*?with_payload=True,\n\s*)with_vectors=True,',
+              r'\1with_vectors=[self._settings.vector_name],',
+              text,
+              count=1,
+          )
+          if protocol_count != 1:
+              raise SystemExit(f'expected one query_points protocol edit, got {protocol_count}')
+          if query_count != 1:
+              raise SystemExit(f'expected one coarse query edit, got {query_count}')
           path.write_text(text)
           PY
           git rm .github/workflows/apply-semantic-named-vector-fix.yml
