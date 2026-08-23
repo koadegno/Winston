@@ -119,9 +119,9 @@ def test_qdrant_settings_reject_non_positive_batch_size() -> None:
         QdrantSettings(upsert_batch_size=0)
 
 
-def test_indexing_visual_batch_size_defaults_to_nine() -> None:
-    """Phase 1E bounds one orchestration embedding batch to nine visuals by default."""
-    assert Settings().indexing.visual_batch_size == 9
+def test_indexing_visual_batch_size_defaults_to_twenty() -> None:
+    """Phase 1E bounds one orchestration embedding batch to twenty visuals by default."""
+    assert Settings().indexing.visual_batch_size == 20
 
 
 def test_indexing_visual_batch_size_reads_nested_environment(
