@@ -1,0 +1,27 @@
+# Video files from release test-dataset-v1
+
+videos/2026-08-22T13-00-00Z.mkv
+videos/2026-08-22T14-00-00Z.mkv
+videos/test.mkv
+
+# ffprobe metadata
+
+## videos/2026-08-22T13-00-00Z.mkv
+index=0
+codec_name=h264
+codec_type=video
+width=1280
+height=720
+avg_frame_rate=22/1
+duration=0.965000
+size=122957
+
+## videos/2026-08-22T14-00-00Z.mkv
+index=0
+codec_name=h264
+codec_type=video
+width=1280
+height=720
+avg_frame_rate=22/1
+duration=1963.613000
+size=160397504
