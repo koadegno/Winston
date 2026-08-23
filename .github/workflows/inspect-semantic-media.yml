@@ -28,7 +28,7 @@ jobs:
         run: |
           set -euo pipefail
           output=tmp/semantic-search-media
-          work="$RUNNER_TEMP/winston-media"
+          work=/tmp/winston-semantic-media
           rm -rf "$work"
           mkdir -p "$work" "$output/contact-sheets"
           rm -f "$output/contact-sheets"/*.jpg "$output/videos-info.txt"
@@ -47,8 +47,9 @@ jobs:
             echo '# ffprobe metadata'
           } > "$output/videos-info.txt"
 
-          while IFS= read -r -d '' video; do
-            rel="${video#"$work/videos/"}"
+          while IFS= read -r -d '' discovered; do
+            video=$(realpath "$discovered")
+            rel=$(realpath --relative-to="$work/videos" "$video")
             safe=$(printf '%s' "$rel" | tr '/ .' '___' | tr -cd '[:alnum:]_-')
             duration=$(ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 "$video")
             {
