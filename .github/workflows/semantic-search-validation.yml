@@ -15,6 +15,11 @@ jobs:
   full-regression:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    services:
+      qdrant:
+        image: qdrant/qdrant:v1.18.2
+        ports:
+          - 6333:6333
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -22,8 +27,23 @@ jobs:
           python-version: '3.13'
       - name: Install uv
         uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+      - name: Install FFmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
       - name: Install locked Winston environment
         run: uv sync --locked
+      - name: Wait for Qdrant 1.18.2
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attempt in {1..60}; do
+            if curl --fail --silent http://localhost:6333/collections >/dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          exit 1
       - name: Run full regression
         run: uv run python -m pytest -q
       - name: Compile Winston source
@@ -61,23 +81,23 @@ jobs:
           set -euo pipefail
           python - <<'PY'
           import asyncio
-          from collections import defaultdict
+          from dataclasses import dataclass, field
           from qdrant_client import AsyncQdrantClient
+
+          @dataclass(slots=True)
+          class SourceStats:
+              points: int = 0
+              media_type: str | None = None
+              assets: set[str] = field(default_factory=set)
+              min_ts: float | None = None
+              max_ts: float | None = None
 
           async def main() -> None:
               client = AsyncQdrantClient(url='http://localhost:6333')
               try:
                   info = await client.get_collection('winston_visual')
                   count = await client.count('winston_visual', exact=True)
-                  by_source: dict[str, dict[str, object]] = defaultdict(
-                      lambda: {
-                          'points': 0,
-                          'media_type': None,
-                          'assets': set(),
-                          'min_ts': None,
-                          'max_ts': None,
-                      }
-                  )
+                  by_source: dict[str, SourceStats] = {}
                   offset = None
                   while True:
                       records, offset = await client.scroll(
@@ -89,22 +109,21 @@ jobs:
                       )
                       for record in records:
                           payload = record.payload or {}
-                          source = str(payload.get('source_path', '<missing>'))
-                          row = by_source[source]
-                          row['points'] = int(row['points']) + 1
-                          row['media_type'] = payload.get('media_type')
+                          source_value = payload.get('source_path')
+                          source = source_value if isinstance(source_value, str) else '<missing>'
+                          row = by_source.setdefault(source, SourceStats())
+                          row.points += 1
+                          media_value = payload.get('media_type')
+                          if isinstance(media_value, str):
+                              row.media_type = media_value
                           asset = payload.get('asset_id')
                           if isinstance(asset, str):
-                              assets = row['assets']
-                              assert isinstance(assets, set)
-                              assets.add(asset)
+                              row.assets.add(asset)
                           timestamp = payload.get('timestamp_seconds')
                           if isinstance(timestamp, (int, float)):
                               value = float(timestamp)
-                              minimum = row['min_ts']
-                              maximum = row['max_ts']
-                              row['min_ts'] = value if minimum is None else min(float(minimum), value)
-                              row['max_ts'] = value if maximum is None else max(float(maximum), value)
+                              row.min_ts = value if row.min_ts is None else min(row.min_ts, value)
+                              row.max_ts = value if row.max_ts is None else max(row.max_ts, value)
                       if offset is None:
                           break
 
@@ -114,11 +133,9 @@ jobs:
                   print('sources:')
                   for source in sorted(by_source):
                       row = by_source[source]
-                      assets = row['assets']
-                      assert isinstance(assets, set)
                       print(
-                          f"- {source} | media={row['media_type']} | points={row['points']} "
-                          f"| assets={len(assets)} | timestamp={row['min_ts']}..{row['max_ts']}"
+                          f'- {source} | media={row.media_type} | points={row.points} '
+                          f'| assets={len(row.assets)} | timestamp={row.min_ts}..{row.max_ts}'
                       )
               finally:
                   await client.close()
