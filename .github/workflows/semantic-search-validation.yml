@@ -1,0 +1,129 @@
+name: Semantic search temporary validation
+
+on:
+  push:
+    branches:
+      - test/semantic-search-validation
+    paths:
+      - '.github/workflows/semantic-search-validation.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  full-regression:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+      - name: Install locked Winston environment
+        run: uv sync --locked
+      - name: Run full regression
+        run: uv run python -m pytest -q
+      - name: Compile Winston source
+        run: uv run python -m compileall -q src/winston
+
+  inspect-real-qdrant:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install Qdrant client
+        run: python -m pip install 'qdrant-client==1.18.0'
+      - name: Start user-provided Qdrant volume
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run -d --name qdrant-real \
+            -p 6333:6333 \
+            -v "$PWD/volumes/qdrant:/qdrant/storage" \
+            qdrant/qdrant:v1.18.2
+          for attempt in {1..60}; do
+            if curl --fail --silent http://localhost:6333/collections >/dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs qdrant-real
+          exit 1
+      - name: Inventory Winston visual collection
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import asyncio
+          from collections import defaultdict
+          from qdrant_client import AsyncQdrantClient
+
+          async def main() -> None:
+              client = AsyncQdrantClient(url='http://localhost:6333')
+              try:
+                  info = await client.get_collection('winston_visual')
+                  count = await client.count('winston_visual', exact=True)
+                  by_source: dict[str, dict[str, object]] = defaultdict(
+                      lambda: {
+                          'points': 0,
+                          'media_type': None,
+                          'assets': set(),
+                          'min_ts': None,
+                          'max_ts': None,
+                      }
+                  )
+                  offset = None
+                  while True:
+                      records, offset = await client.scroll(
+                          'winston_visual',
+                          limit=1000,
+                          offset=offset,
+                          with_payload=True,
+                          with_vectors=False,
+                      )
+                      for record in records:
+                          payload = record.payload or {}
+                          source = str(payload.get('source_path', '<missing>'))
+                          row = by_source[source]
+                          row['points'] = int(row['points']) + 1
+                          row['media_type'] = payload.get('media_type')
+                          asset = payload.get('asset_id')
+                          if isinstance(asset, str):
+                              assets = row['assets']
+                              assert isinstance(assets, set)
+                              assets.add(asset)
+                          timestamp = payload.get('timestamp_seconds')
+                          if isinstance(timestamp, (int, float)):
+                              value = float(timestamp)
+                              minimum = row['min_ts']
+                              maximum = row['max_ts']
+                              row['min_ts'] = value if minimum is None else min(float(minimum), value)
+                              row['max_ts'] = value if maximum is None else max(float(maximum), value)
+                      if offset is None:
+                          break
+
+                  print('collection=winston_visual')
+                  print(f'points={count.count}')
+                  print(f'metadata={info.config.metadata}')
+                  print('sources:')
+                  for source in sorted(by_source):
+                      row = by_source[source]
+                      assets = row['assets']
+                      assert isinstance(assets, set)
+                      print(
+                          f"- {source} | media={row['media_type']} | points={row['points']} "
+                          f"| assets={len(assets)} | timestamp={row['min_ts']}..{row['max_ts']}"
+                      )
+              finally:
+                  await client.close()
+
+          asyncio.run(main())
+          PY
+      - name: Stop temporary Qdrant
+        if: always()
+        run: docker rm -f qdrant-real || true
