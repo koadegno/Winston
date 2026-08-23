@@ -4,18 +4,12 @@ on:
   pull_request:
     paths:
       - '.github/workflows/apply-semantic-named-vector-fix.yml'
-  push:
-    branches:
-      - feat/semantic-search-cli
-    paths:
-      - '.github/workflows/apply-semantic-named-vector-fix.yml'
 
 permissions:
   contents: write
 
 jobs:
   apply:
-    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -30,15 +24,37 @@ jobs:
 
           path = Path('src/winston/index/qdrant.py')
           text = path.read_text()
-          protocol_old = '        with_vectors: bool,\n'
-          protocol_new = '        with_vectors: list[str],\n'
-          query_old = '                with_vectors=True,\n'
-          query_new = '                with_vectors=[self._settings.vector_name],\n'
-          if text.count(protocol_old) != 1:
-              raise SystemExit('expected exactly one query_points with_vectors protocol annotation')
-          if text.count(query_old) != 1:
-              raise SystemExit('expected exactly one coarse query with_vectors=True call')
-          text = text.replace(protocol_old, protocol_new).replace(query_old, query_new)
+          protocol_old = '''    async def query_points(
+              self,
+              collection_name: str,
+              *,
+              query: list[float],
+              using: str,
+              limit: int,
+              with_payload: bool,
+              with_vectors: bool,
+          ) -> models.QueryResponse:
+          '''
+          protocol_new = protocol_old.replace('with_vectors: bool,', 'with_vectors: list[str],')
+          query_old = '''            response = await self._client.query_points(
+                  self._settings.collection,
+                  query=query_vector.tolist(),
+                  using=self._settings.vector_name,
+                  limit=limit,
+                  with_payload=True,
+                  with_vectors=True,
+              )
+          '''
+          query_new = query_old.replace(
+              'with_vectors=True,',
+              'with_vectors=[self._settings.vector_name],',
+          )
+          if protocol_old not in text:
+              raise SystemExit('query_points protocol block not found')
+          if query_old not in text:
+              raise SystemExit('coarse query block not found')
+          text = text.replace(protocol_old, protocol_new, 1)
+          text = text.replace(query_old, query_new, 1)
           path.write_text(text)
           PY
           git rm .github/workflows/apply-semantic-named-vector-fix.yml
