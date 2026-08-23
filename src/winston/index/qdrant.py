@@ -1,18 +1,19 @@
 """Qdrant implementation of Winston's class-agnostic visual index."""
 
-from collections.abc import Sequence
+from collections.abc import AsyncIterator, Sequence
 from itertools import batched
-from typing import Protocol
+from typing import Protocol, cast
 from uuid import UUID, uuid4
 
 import numpy as np
-from pydantic import BaseModel, ConfigDict, ValidationError
+from pydantic import BaseModel, ConfigDict, JsonValue, ValidationError
 from qdrant_client import AsyncQdrantClient, models
 
 from winston.config import QdrantSettings
 from winston.embeddings.models import EmbeddingIdentity
 from winston.index.identity import visual_point_id
 from winston.index.models import (
+    ASSET_ID_PATTERN,
     IncompatibleVisualIndexError,
     IndexedVisual,
     RegionGeometry,
@@ -29,6 +30,8 @@ from winston.sampling.regions import RegionKind
 
 type CollectionMetadataValue = str | int
 type CollectionMetadata = dict[str, CollectionMetadataValue]
+type DenseVectorOutput = list[float] | dict[str, list[float]] | None
+type ScrollOffset = int | str | None
 
 WINSTON_SCHEMA_VERSION = 2
 VISUAL_DISTANCE = models.Distance.COSINE
@@ -63,6 +66,13 @@ class _StoredVisualPayload(BaseModel):
     model_id: str
     dimension: int
     preprocessing_version: int
+
+
+class _StoredPoint(Protocol):
+    """Storage-read shape shared by Qdrant scored points and scroll records."""
+
+    payload: dict[str, JsonValue] | None
+    vector: DenseVectorOutput
 
 
 class _CollectionParams(Protocol):
@@ -118,6 +128,19 @@ class _QdrantClient(Protocol):
         """Return coarse semantic nearest neighbors for one dense query vector."""
         ...
 
+    async def scroll(
+        self,
+        collection_name: str,
+        *,
+        scroll_filter: models.Filter,
+        limit: int,
+        offset: ScrollOffset,
+        with_payload: bool,
+        with_vectors: list[str],
+    ) -> tuple[list[models.Record], ScrollOffset]:
+        """Return one bounded page of stored visual records."""
+        ...
+
     async def delete(
         self,
         collection_name: str,
@@ -150,10 +173,20 @@ class QdrantVisualIndex:
         self,
         settings: QdrantSettings,
         *,
+        timeline_page_size: int = 256,
         client: _QdrantClient | None = None,
     ) -> None:
         """Create an index session around one reusable asynchronous Qdrant client."""
+        if (
+            isinstance(timeline_page_size, bool)
+            or not isinstance(timeline_page_size, int)
+            or timeline_page_size <= 0
+        ):
+            raise VisualIndexConfigurationError(
+                "timeline_page_size must be a positive integer"
+            )
         self._settings = settings
+        self._timeline_page_size = timeline_page_size
         self._client: _QdrantClient = client or AsyncQdrantClient(url=settings.url)
         self._identity: EmbeddingIdentity | None = None
         self._search_identity: EmbeddingIdentity | None = None
@@ -273,6 +306,89 @@ class QdrantVisualIndex:
             raise VisualIndexError(
                 f"Failed to query visual index collection '{self._settings.collection}'"
             ) from exc
+
+    async def iter_visuals(
+        self,
+        *,
+        asset_id: str,
+        start_timestamp_us: int,
+        end_timestamp_us: int,
+    ) -> AsyncIterator[IndexedVisual]:
+        """Stream every stored video visual in one bounded asset/time window page by page."""
+        identity = self._search_identity
+        if identity is None:
+            raise VisualIndexConfigurationError(
+                "open_search() must succeed before timeline retrieval"
+            )
+        self._validate_timeline_window(
+            asset_id=asset_id,
+            start_timestamp_us=start_timestamp_us,
+            end_timestamp_us=end_timestamp_us,
+        )
+
+        scroll_filter = models.Filter(
+            must=[
+                models.FieldCondition(
+                    key="asset_id",
+                    match=models.MatchValue(value=asset_id),
+                ),
+                models.FieldCondition(
+                    key="media_type",
+                    match=models.MatchValue(value=MediaType.VIDEO.value),
+                ),
+                models.FieldCondition(
+                    key="timestamp_us",
+                    range=models.Range(
+                        gte=start_timestamp_us,
+                        lte=end_timestamp_us,
+                    ),
+                ),
+            ]
+        )
+        offset: ScrollOffset = None
+
+        while True:
+            try:
+                records, next_offset = await self._client.scroll(
+                    self._settings.collection,
+                    scroll_filter=scroll_filter,
+                    limit=self._timeline_page_size,
+                    offset=offset,
+                    with_payload=True,
+                    with_vectors=[self._settings.vector_name],
+                )
+            except (IncompatibleVisualIndexError, VisualIndexConfigurationError, VisualIndexError):
+                raise
+            except Exception as exc:
+                raise VisualIndexError(
+                    f"Failed to scroll visual timeline from collection '{self._settings.collection}'"
+                ) from exc
+
+            for record in records:
+                visual = self._visual_from_stored_point(
+                    cast(_StoredPoint, record),
+                    identity,
+                )
+                timestamp_us = visual.timestamp_us
+                if (
+                    visual.asset_id != asset_id
+                    or visual.media_type is not MediaType.VIDEO
+                    or timestamp_us is None
+                    or timestamp_us < start_timestamp_us
+                    or timestamp_us > end_timestamp_us
+                ):
+                    raise IncompatibleVisualIndexError(
+                        "Qdrant timeline result violates the requested asset/time window"
+                    )
+                yield visual
+
+            if next_offset is None:
+                break
+            if next_offset == offset:
+                raise VisualIndexError(
+                    "Qdrant timeline scroll cursor did not advance"
+                )
+            offset = next_offset
 
     async def delete_old_revisions(
         self,
@@ -476,21 +592,50 @@ class QdrantVisualIndex:
         if not bool(np.any(query_vector != 0.0)):
             raise VisualIndexConfigurationError("query vector must be non-zero")
 
-    def _scored_visual_from_point(
+    def _validate_timeline_window(
         self,
-        point: models.ScoredPoint,
+        *,
+        asset_id: str,
+        start_timestamp_us: int,
+        end_timestamp_us: int,
+    ) -> None:
+        """Validate one bounded semantic-refinement window before provider I/O."""
+        if ASSET_ID_PATTERN.fullmatch(asset_id) is None:
+            raise VisualIndexConfigurationError(
+                "asset_id must be a 64-character lowercase SHA-256 hexadecimal string"
+            )
+        for field_name, value in (
+            ("start_timestamp_us", start_timestamp_us),
+            ("end_timestamp_us", end_timestamp_us),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise VisualIndexConfigurationError(
+                    f"{field_name} must be an integer"
+                )
+            if value < 0:
+                raise VisualIndexConfigurationError(
+                    "timeline timestamps must be non-negative"
+                )
+        if start_timestamp_us > end_timestamp_us:
+            raise VisualIndexConfigurationError(
+                "timeline start_timestamp_us must be <= end_timestamp_us"
+            )
+
+    def _visual_from_stored_point(
+        self,
+        point: _StoredPoint,
         identity: EmbeddingIdentity,
-    ) -> ScoredVisual:
-        """Validate one Qdrant result and reconstruct the storage-neutral Winston visual."""
+    ) -> IndexedVisual:
+        """Validate one Qdrant payload/vector pair and reconstruct a Winston visual."""
         if point.payload is None:
             raise IncompatibleVisualIndexError(
-                "Qdrant semantic result is missing its Winston visual payload"
+                "Qdrant visual result is missing its Winston visual payload"
             )
         try:
             stored = _StoredVisualPayload.model_validate(point.payload)
         except ValidationError as exc:
             raise IncompatibleVisualIndexError(
-                "Qdrant semantic result contains an invalid Winston visual payload"
+                "Qdrant visual result contains an invalid Winston visual payload"
             ) from exc
 
         expected_identity: tuple[tuple[str, str | int, str | int], ...] = (
@@ -511,7 +656,7 @@ class QdrantVisualIndex:
         vectors = point.vector
         if not isinstance(vectors, dict) or self._settings.vector_name not in vectors:
             raise IncompatibleVisualIndexError(
-                f"Qdrant semantic result is missing named vector '{self._settings.vector_name}'"
+                f"Qdrant visual result is missing named vector '{self._settings.vector_name}'"
             )
         raw_vector = vectors[self._settings.vector_name]
         if not isinstance(raw_vector, list):
@@ -543,13 +688,22 @@ class QdrantVisualIndex:
             )
         except (TypeError, ValueError, ValidationError) as exc:
             raise IncompatibleVisualIndexError(
-                "Qdrant semantic result cannot be reconstructed as a valid Winston visual"
+                "Qdrant visual result cannot be reconstructed as a valid Winston visual"
             ) from exc
 
         if visual.timestamp_us != stored.timestamp_us:
             raise IncompatibleVisualIndexError(
                 "Qdrant visual payload timestamp_us does not match timestamp_seconds"
             )
+        return visual
+
+    def _scored_visual_from_point(
+        self,
+        point: models.ScoredPoint,
+        identity: EmbeddingIdentity,
+    ) -> ScoredVisual:
+        """Pair one validated Qdrant ANN score with its reconstructed Winston visual."""
+        visual = self._visual_from_stored_point(cast(_StoredPoint, point), identity)
         try:
             return ScoredVisual(visual=visual, score=point.score)
         except (TypeError, ValueError) as exc:
