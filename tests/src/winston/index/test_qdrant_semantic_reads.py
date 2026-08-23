@@ -1,9 +1,9 @@
 from dataclasses import dataclass
-from typing import cast
 
 import numpy as np
 import pytest
 from pydantic import JsonValue
+from qdrant_client import models
 
 from winston.config import QdrantSettings
 from winston.embeddings.models import EmbeddingIdentity
@@ -68,24 +68,7 @@ def _payload(**overrides: JsonValue) -> dict[str, JsonValue]:
 class SearchCollectionParams:
     """Minimal Qdrant collection params consumed by read-only compatibility checks."""
 
-    vectors: dict[str, "VectorParams"]
-
-
-@dataclass(frozen=True, slots=True)
-class VectorParams:
-    """Provider-neutral vector shape needed by the fake collection info."""
-
-    size: int
-    distance: "DistanceValue"
-
-
-class DistanceValue:
-    """Small identity-stable fake matching the Qdrant distance enum surface."""
-
-    value = "Cosine"
-
-
-COSINE = DistanceValue()
+    vectors: dict[str, models.VectorParams]
 
 
 @dataclass(slots=True)
@@ -146,13 +129,16 @@ class SearchOnlyQdrantClient:
         self.info = SearchCollectionInfo(
             config=SearchCollectionConfig(
                 params=SearchCollectionParams(
-                    vectors={"visual": VectorParams(size=768, distance=cast(DistanceValue, None))}
+                    vectors={
+                        "visual": models.VectorParams(
+                            size=768,
+                            distance=models.Distance.COSINE,
+                        )
+                    }
                 ),
                 metadata=_metadata() if metadata is None else metadata,
             )
         )
-        # The production adapter compares Qdrant's enum by identity. Replace the fake value after
-        # construction so this fake can be adjusted by the test once the real enum is imported.
         self.points = [] if points is None else points
         self.query_calls: list[QueryCall] = []
         self.closed = False
@@ -199,14 +185,8 @@ def _client(
     metadata: Metadata | None = None,
     points: list[FakeScoredPoint] | None = None,
 ) -> SearchOnlyQdrantClient:
-    """Build a read-only fake using Qdrant's real cosine enum identity."""
-    from qdrant_client import models
-
-    client = SearchOnlyQdrantClient(exists=exists, metadata=metadata, points=points)
-    client.info.config.params.vectors = {
-        "visual": cast(VectorParams, models.VectorParams(size=768, distance=models.Distance.COSINE))
-    }
-    return client
+    """Build one mutation-free Qdrant fake for semantic-read contracts."""
+    return SearchOnlyQdrantClient(exists=exists, metadata=metadata, points=points)
 
 
 @pytest.mark.asyncio
