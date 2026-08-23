@@ -1,0 +1,38 @@
+name: Inspect semantic-search media release
+
+on:
+  push:
+    branches:
+      - test/semantic-search-media-inspection
+    paths:
+      - '.github/workflows/inspect-semantic-media.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  inspect-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: test/semantic-search-media-inspection
+      - name: Inspect releases and assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p tmp/semantic-search-media
+          {
+            echo '# Releases'
+            gh release list --repo "$GITHUB_REPOSITORY" --limit 20
+            echo
+            echo '# Latest release JSON'
+            gh release view --repo "$GITHUB_REPOSITORY" --json tagName,name,publishedAt,url,assets
+          } > tmp/semantic-search-media/release-info.txt
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add tmp/semantic-search-media/release-info.txt
+          git commit -m 'test: inspect semantic search media release'
+          git push origin HEAD:test/semantic-search-media-inspection
