@@ -1,0 +1,48 @@
+name: Semantic search unit contracts
+
+on:
+  pull_request:
+    paths:
+      - 'src/winston/config.py'
+      - 'src/winston/cli.py'
+      - 'src/winston/index/**'
+      - 'src/winston/search/**'
+      - 'tests/src/winston/test_config.py'
+      - 'tests/src/winston/test_cli.py'
+      - 'tests/src/winston/index/**'
+      - 'tests/src/winston/search/**'
+      - '.github/workflows/semantic-search-unit.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install focused dependencies
+        run: |
+          python -m pip install \
+            'numpy>=2.3.0' \
+            'pillow>=12.0.0' \
+            'pydantic>=2.13.4' \
+            'pydantic-settings>=2.15.0' \
+            'pytest>=9.1.1' \
+            'pytest-asyncio>=1.4.0' \
+            'qdrant-client==1.18.0'
+          python -m pip install -e . --no-deps
+      - name: Run semantic-search unit contracts
+        run: >-
+          python -m pytest -q
+          tests/src/winston/test_config.py
+          tests/src/winston/test_cli.py
+          tests/src/winston/index
+          tests/src/winston/search
+      - name: Compile Winston source
+        run: python -m compileall -q src/winston
