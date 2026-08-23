@@ -5,6 +5,8 @@ from itertools import batched
 from typing import Protocol
 from uuid import UUID, uuid4
 
+import numpy as np
+from pydantic import BaseModel, ConfigDict, ValidationError
 from qdrant_client import AsyncQdrantClient, models
 
 from winston.config import QdrantSettings
@@ -13,10 +15,17 @@ from winston.index.identity import visual_point_id
 from winston.index.models import (
     IncompatibleVisualIndexError,
     IndexedVisual,
+    RegionGeometry,
+    SampleKind,
+    ScoredVisual,
     VisualIndexConfigurationError,
     VisualIndexError,
     VisualIndexSession,
+    VisualSearchSession,
+    VisualVector,
 )
+from winston.ingest.models import MediaType
+from winston.sampling.regions import RegionKind
 
 type CollectionMetadataValue = str | int
 type CollectionMetadata = dict[str, CollectionMetadataValue]
@@ -24,6 +33,36 @@ type CollectionMetadata = dict[str, CollectionMetadataValue]
 WINSTON_SCHEMA_VERSION = 2
 VISUAL_DISTANCE = models.Distance.COSINE
 VISUAL_DISTANCE_NAME = "cosine"
+
+
+class _StoredRegion(BaseModel):
+    """Strict JSON region shape persisted in one schema-v2 Qdrant payload."""
+
+    model_config = ConfigDict(frozen=True, strict=True, extra="forbid")
+
+    x: int
+    y: int
+    width: int
+    height: int
+    scale: float
+
+
+class _StoredVisualPayload(BaseModel):
+    """Strict schema-v2 payload required to reconstruct one Winston visual safely."""
+
+    model_config = ConfigDict(frozen=True, strict=True, extra="forbid")
+
+    asset_id: str
+    source_path: str
+    media_type: str
+    sample_kind: str
+    timestamp_seconds: float | None
+    region_kind: str
+    region: _StoredRegion
+    timestamp_us: int | None
+    model_id: str
+    dimension: int
+    preprocessing_version: int
 
 
 class _CollectionParams(Protocol):
@@ -66,6 +105,19 @@ class _QdrantClient(Protocol):
         """Return the collection configuration needed for compatibility validation."""
         ...
 
+    async def query_points(
+        self,
+        collection_name: str,
+        *,
+        query: list[float],
+        using: str,
+        limit: int,
+        with_payload: bool,
+        with_vectors: bool,
+    ) -> models.QueryResponse:
+        """Return coarse semantic nearest neighbors for one dense query vector."""
+        ...
+
     async def delete(
         self,
         collection_name: str,
@@ -104,6 +156,7 @@ class QdrantVisualIndex:
         self._settings = settings
         self._client: _QdrantClient = client or AsyncQdrantClient(url=settings.url)
         self._identity: EmbeddingIdentity | None = None
+        self._search_identity: EmbeddingIdentity | None = None
 
     async def ensure_compatible(
         self,
@@ -156,6 +209,70 @@ class QdrantVisualIndex:
 
         self._identity = identity
         return VisualIndexSession(index_instance_id=index_instance_id)
+
+    async def open_search(self, identity: EmbeddingIdentity) -> VisualSearchSession:
+        """Open an existing compatible collection for semantic reads without mutating Qdrant."""
+        try:
+            exists = await self._client.collection_exists(self._settings.collection)
+            if not exists:
+                raise VisualIndexConfigurationError(
+                    f"Visual index collection '{self._settings.collection}' does not exist; "
+                    "run 'winston index' first."
+                )
+
+            info = await self._client.get_collection(self._settings.collection)
+            dataset_instance_id = self._dataset_instance_id(info)
+            index_instance_id = self._validate_collection(
+                info,
+                identity,
+                dataset_instance_id,
+            )
+        except (IncompatibleVisualIndexError, VisualIndexConfigurationError, VisualIndexError):
+            raise
+        except Exception as exc:
+            raise VisualIndexError(
+                f"Failed to open visual index collection '{self._settings.collection}' for search"
+            ) from exc
+
+        self._search_identity = identity
+        return VisualSearchSession(
+            dataset_instance_id=dataset_instance_id,
+            index_instance_id=index_instance_id,
+        )
+
+    async def search_visuals(
+        self,
+        query_vector: VisualVector,
+        *,
+        limit: int,
+    ) -> Sequence[ScoredVisual]:
+        """Return coarse Qdrant ANN candidates mapped immediately to Winston-owned models."""
+        identity = self._search_identity
+        if identity is None:
+            raise VisualIndexConfigurationError(
+                "open_search() must succeed before semantic visual retrieval"
+            )
+        self._validate_query_vector(query_vector, identity, limit=limit)
+
+        try:
+            response = await self._client.query_points(
+                self._settings.collection,
+                query=query_vector.tolist(),
+                using=self._settings.vector_name,
+                limit=limit,
+                with_payload=True,
+                with_vectors=True,
+            )
+            return tuple(
+                self._scored_visual_from_point(point, identity)
+                for point in response.points
+            )
+        except (IncompatibleVisualIndexError, VisualIndexConfigurationError, VisualIndexError):
+            raise
+        except Exception as exc:
+            raise VisualIndexError(
+                f"Failed to query visual index collection '{self._settings.collection}'"
+            ) from exc
 
     async def delete_old_revisions(
         self,
@@ -309,6 +426,135 @@ class QdrantVisualIndex:
                 f"Incompatible visual index collection '{self._settings.collection}': "
                 "metadata field 'index_instance_id' is not a UUID. "
                 "Explicit reindexing is required."
+            ) from exc
+
+    def _dataset_instance_id(self, info: _CollectionInfo) -> str:
+        """Read and canonicalize the persisted dataset UUID required by read-only search."""
+        metadata = info.config.metadata
+        if metadata is None:
+            raise IncompatibleVisualIndexError(
+                f"Incompatible visual index collection '{self._settings.collection}': "
+                "Winston metadata is missing. Explicit reindexing is required."
+            )
+        raw_dataset_id = metadata.get("dataset_instance_id")
+        if not isinstance(raw_dataset_id, str):
+            raise IncompatibleVisualIndexError(
+                f"Incompatible visual index collection '{self._settings.collection}': "
+                "required metadata field 'dataset_instance_id' is missing or invalid. "
+                "Explicit reindexing is required."
+            )
+        try:
+            return str(UUID(raw_dataset_id))
+        except ValueError as exc:
+            raise IncompatibleVisualIndexError(
+                f"Incompatible visual index collection '{self._settings.collection}': "
+                "metadata field 'dataset_instance_id' is not a UUID. "
+                "Explicit reindexing is required."
+            ) from exc
+
+    def _validate_query_vector(
+        self,
+        query_vector: VisualVector,
+        identity: EmbeddingIdentity,
+        *,
+        limit: int,
+    ) -> None:
+        """Reject malformed query vectors and limits before issuing an ANN request."""
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
+            raise VisualIndexConfigurationError("search limit must be a positive integer")
+        if query_vector.ndim != 1:
+            raise VisualIndexConfigurationError("query vector must be one-dimensional")
+        if query_vector.dtype != np.float32:
+            raise VisualIndexConfigurationError("query vector dtype must be float32")
+        if query_vector.shape[0] != identity.dimension:
+            raise VisualIndexConfigurationError(
+                f"query vector dimension {query_vector.shape[0]} does not match "
+                f"embedding identity dimension {identity.dimension}"
+            )
+        if not bool(np.isfinite(query_vector).all()):
+            raise VisualIndexConfigurationError("query vector values must all be finite")
+        if not bool(np.any(query_vector != 0.0)):
+            raise VisualIndexConfigurationError("query vector must be non-zero")
+
+    def _scored_visual_from_point(
+        self,
+        point: models.ScoredPoint,
+        identity: EmbeddingIdentity,
+    ) -> ScoredVisual:
+        """Validate one Qdrant result and reconstruct the storage-neutral Winston visual."""
+        if point.payload is None:
+            raise IncompatibleVisualIndexError(
+                "Qdrant semantic result is missing its Winston visual payload"
+            )
+        try:
+            stored = _StoredVisualPayload.model_validate(point.payload)
+        except ValidationError as exc:
+            raise IncompatibleVisualIndexError(
+                "Qdrant semantic result contains an invalid Winston visual payload"
+            ) from exc
+
+        expected_identity: tuple[tuple[str, str | int, str | int], ...] = (
+            ("model_id", identity.model_id, stored.model_id),
+            ("dimension", identity.dimension, stored.dimension),
+            (
+                "preprocessing_version",
+                identity.preprocessing_version,
+                stored.preprocessing_version,
+            ),
+        )
+        for field, expected, actual in expected_identity:
+            if actual != expected:
+                raise IncompatibleVisualIndexError(
+                    f"Qdrant visual payload field '{field}' expected {expected!r}, actual {actual!r}"
+                )
+
+        vectors = point.vector
+        if not isinstance(vectors, dict) or self._settings.vector_name not in vectors:
+            raise IncompatibleVisualIndexError(
+                f"Qdrant semantic result is missing named vector '{self._settings.vector_name}'"
+            )
+        raw_vector = vectors[self._settings.vector_name]
+        if not isinstance(raw_vector, list):
+            raise IncompatibleVisualIndexError(
+                f"Qdrant named vector '{self._settings.vector_name}' is not a dense vector"
+            )
+        try:
+            vector = np.asarray(raw_vector, dtype=np.float32)
+            media_type = MediaType(stored.media_type)
+            sample_kind = SampleKind(stored.sample_kind)
+            region_kind = RegionKind(stored.region_kind)
+            region = RegionGeometry(
+                x=stored.region.x,
+                y=stored.region.y,
+                width=stored.region.width,
+                height=stored.region.height,
+                scale=stored.region.scale,
+            )
+            visual = IndexedVisual(
+                asset_id=stored.asset_id,
+                source_path=stored.source_path,
+                media_type=media_type,
+                sample_kind=sample_kind,
+                timestamp_seconds=stored.timestamp_seconds,
+                region_kind=region_kind,
+                region=region,
+                vector=vector,
+                embedding_identity=identity,
+            )
+        except (TypeError, ValueError, ValidationError) as exc:
+            raise IncompatibleVisualIndexError(
+                "Qdrant semantic result cannot be reconstructed as a valid Winston visual"
+            ) from exc
+
+        if visual.timestamp_us != stored.timestamp_us:
+            raise IncompatibleVisualIndexError(
+                "Qdrant visual payload timestamp_us does not match timestamp_seconds"
+            )
+        try:
+            return ScoredVisual(visual=visual, score=point.score)
+        except (TypeError, ValueError) as exc:
+            raise IncompatibleVisualIndexError(
+                "Qdrant semantic result contains an invalid score"
             ) from exc
 
     def _collection_metadata(
