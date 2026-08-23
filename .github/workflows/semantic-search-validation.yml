@@ -145,3 +145,75 @@ jobs:
       - name: Stop temporary Qdrant
         if: always()
         run: docker rm -f qdrant-real || true
+
+  real-jina-search:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      EMBEDDING__ENGINE: jina-api
+      EMBEDDING__API_KEY: ${{ secrets.JINA_API_KEY }}
+      QDRANT__URL: http://localhost:6333
+      QDRANT__COLLECTION: winston_visual
+      SEARCH__RESULT_LIMIT: '3'
+      SEARCH__CANDIDATE_LIMIT: '200'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install focused API-search dependencies
+        run: |
+          python -m pip install \
+            'httpx>=0.28.1' \
+            'numpy>=2.3.0' \
+            'pillow>=12.0.0' \
+            'pydantic>=2.13.4' \
+            'pydantic-settings>=2.15.0' \
+            'qdrant-client==1.18.0'
+          python -m pip install -e . --no-deps
+      - name: Require Jina API secret
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "${EMBEDDING__API_KEY:-}" ]; then
+            echo 'JINA_API_KEY repository secret is required for real semantic validation.' >&2
+            exit 1
+          fi
+      - name: Start user-provided Qdrant volume
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run -d --name qdrant-search \
+            -p 6333:6333 \
+            -v "$PWD/volumes/qdrant:/qdrant/storage" \
+            qdrant/qdrant:v1.18.2
+          for attempt in {1..60}; do
+            if curl --fail --silent http://localhost:6333/collections >/dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs qdrant-search
+          exit 1
+      - name: Search real indexed videos with Jina CLIP
+        shell: bash
+        run: |
+          set -euo pipefail
+          queries=(
+            'a person walking on the street'
+            'a car on the road'
+            'a traffic light at an intersection'
+            'a bicycle or cyclist'
+            'a bus or large vehicle'
+            'people crossing the road'
+            'a white car'
+            'a red car'
+          )
+          for query in "${queries[@]}"; do
+            echo
+            echo "===== QUERY: $query ====="
+            winston search "$query" --limit 3
+          done
+      - name: Stop temporary Qdrant
+        if: always()
+        run: docker rm -f qdrant-search || true
