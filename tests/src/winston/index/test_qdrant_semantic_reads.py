@@ -111,7 +111,7 @@ class QueryCall:
     using: str
     limit: int
     with_payload: bool
-    with_vectors: bool
+    with_vectors: list[str]
 
 
 class SearchOnlyQdrantClient:
@@ -159,7 +159,7 @@ class SearchOnlyQdrantClient:
         using: str,
         limit: int,
         with_payload: bool,
-        with_vectors: bool,
+        with_vectors: list[str],
     ) -> FakeQueryResponse:
         """Capture one coarse ANN query and return configured points."""
         self.query_calls.append(
@@ -226,7 +226,7 @@ async def test_open_search_rejects_invalid_dataset_uuid_in_collection_metadata()
 
 @pytest.mark.asyncio
 async def test_search_visuals_queries_named_vector_and_maps_winston_visual() -> None:
-    """Coarse ANN retrieval asks for payload+vector and immediately returns Winston-owned models."""
+    """Coarse ANN retrieval asks only for the named visual vector plus payload."""
     stored_vector = [0.0] * 768
     stored_vector[17] = 1.0
     point = FakeScoredPoint(
@@ -249,7 +249,7 @@ async def test_search_visuals_queries_named_vector_and_maps_winston_visual() -> 
     assert call.using == "visual"
     assert call.limit == 23
     assert call.with_payload is True
-    assert call.with_vectors is True
+    assert call.with_vectors == ["visual"]
 
     assert len(matches) == 1
     match = matches[0]
