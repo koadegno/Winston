@@ -9,8 +9,12 @@ from winston.ingest.models import MediaType
 from winston.sampling.regions import RegionKind
 from winston.search.temporal import (
     build_temporal_windows,
+    centered_moving_average,
     collapse_best_by_timestamp,
     cosine_similarity,
+    maximum_subarray,
+    population_z_scores,
+    select_passage,
 )
 
 IDENTITY = EmbeddingIdentity(
@@ -220,3 +224,121 @@ def test_build_temporal_windows_rejects_invalid_context(context_seconds: float) 
 
     with pytest.raises(ValueError, match="context_seconds"):
         build_temporal_windows(seeds, context_seconds=context_seconds)
+
+
+def test_centered_moving_average_width_three_uses_available_edge_neighbors() -> None:
+    """Width 3 uses previous/current/next inside the sequence and only available values at edges."""
+    smoothed = centered_moving_average([1.0, 2.0, 3.0, 4.0, 5.0], width=3)
+
+    assert smoothed == pytest.approx((1.5, 2.0, 3.0, 4.0, 4.5))
+
+
+@pytest.mark.parametrize("width", [0, 2, 4])
+def test_centered_moving_average_rejects_non_positive_or_even_width(width: int) -> None:
+    """A centered semantic smoothing window must have one exact center sample."""
+    with pytest.raises(ValueError, match="odd.*positive|positive.*odd"):
+        centered_moving_average([1.0, 2.0, 3.0], width=width)
+
+
+def test_population_z_scores_use_population_standard_deviation() -> None:
+    """Population z-score uses ddof=0 and is only an internal local-sequence normalization."""
+    scores = population_z_scores([1.0, 2.0, 3.0])
+
+    assert scores is not None
+    assert scores == pytest.approx((-1.2247448714, 0.0, 1.2247448714))
+
+
+def test_population_z_scores_return_none_for_zero_variance() -> None:
+    """A flat local sequence carries no relative temporal signal and triggers raw-score fallback."""
+    assert population_z_scores([0.5, 0.5, 0.5]) is None
+
+
+def test_maximum_subarray_selects_documented_positive_cluster() -> None:
+    """Kadane selects 1.2, 1.5, 0.9 from the documented local z-score example."""
+    selected = maximum_subarray([-0.8, -0.3, 1.2, 1.5, 0.9, -0.2, -1.0])
+
+    assert selected == (2, 4)
+
+
+def test_maximum_subarray_returns_none_without_positive_signal() -> None:
+    """A non-positive sequence has no positive contiguous temporal signal."""
+    assert maximum_subarray([-1.0, 0.0, -2.0]) is None
+
+
+def test_maximum_subarray_prefers_shorter_equal_sum_range() -> None:
+    """For equal sum, [1.0] beats the longer [1.0, 0.0] interval."""
+    assert maximum_subarray([1.0, 0.0, -2.0]) == (0, 0)
+
+
+def test_maximum_subarray_prefers_earlier_equal_length_range() -> None:
+    """For equal sum and equal length, the earlier interval is deterministic."""
+    assert maximum_subarray([1.0, -2.0, 1.0]) == (0, 0)
+
+
+def test_select_passage_falls_back_to_strongest_raw_match_for_short_sequence() -> None:
+    """With fewer than three sampled timestamps Winston cannot infer a sustained temporal signal."""
+    observations = collapse_best_by_timestamp(
+        [_video_match(4.0, 0.2), _video_match(8.0, 0.8)]
+    )
+
+    passage = select_passage(observations, moving_average_frames=3)
+
+    assert passage.start_timestamp_us == 8_000_000
+    assert passage.end_timestamp_us == 8_000_000
+    assert passage.representative.score == pytest.approx(0.8)
+
+
+def test_select_passage_falls_back_to_earliest_strongest_raw_match_for_flat_sequence() -> None:
+    """Zero local variance cannot produce z-score evidence, so equal raw scores choose the earliest sample."""
+    observations = collapse_best_by_timestamp(
+        [_video_match(0.0, 0.5), _video_match(4.0, 0.5), _video_match(8.0, 0.5)]
+    )
+
+    passage = select_passage(observations, moving_average_frames=3)
+
+    assert passage.start_timestamp_us == 0
+    assert passage.end_timestamp_us == 0
+    assert passage.representative.visual.timestamp_us == 0
+
+
+def test_select_passage_prefers_sustained_cluster_over_isolated_raw_spike() -> None:
+    """Smoothing + local z-score makes a sustained cluster win over one isolated higher raw frame."""
+    raw_scores = [0.1, 0.1, 1.0, 0.1, 0.1, 0.1, 0.1, 0.65, 0.8, 0.7, 0.1, 0.1]
+    matches = [
+        _video_match(
+            float(index * 4),
+            score,
+            region_kind=RegionKind.TILE if index == 8 else RegionKind.FULL,
+            tile_index=index,
+        )
+        for index, score in enumerate(raw_scores)
+    ]
+    observations = collapse_best_by_timestamp(matches)
+
+    passage = select_passage(observations, moving_average_frames=3)
+
+    assert passage.start_timestamp_us == 28_000_000
+    assert passage.end_timestamp_us == 36_000_000
+    assert passage.representative.score == pytest.approx(0.8)
+    assert passage.representative.visual.timestamp_us == 32_000_000
+    assert passage.representative.visual.region_kind is RegionKind.TILE
+
+
+def test_select_passage_sorts_observations_by_exact_timestamp() -> None:
+    """Provider order does not affect passage boundaries because temporal math sorts timestamp_us exactly."""
+    observations = list(
+        collapse_best_by_timestamp(
+            [
+                _video_match(0.0, 0.1),
+                _video_match(4.0, 0.6),
+                _video_match(8.0, 0.7),
+                _video_match(12.0, 0.6),
+                _video_match(16.0, 0.1),
+            ]
+        )
+    )
+    observations.reverse()
+
+    passage = select_passage(observations, moving_average_frames=3)
+
+    assert passage.start_timestamp_us <= passage.representative.visual.timestamp_us <= passage.end_timestamp_us
