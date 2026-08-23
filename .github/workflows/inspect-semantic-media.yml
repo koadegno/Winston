@@ -1,9 +1,7 @@
 name: Inspect semantic-search media release
 
 on:
-  push:
-    branches:
-      - test/semantic-search-media-inspection
+  pull_request:
     paths:
       - '.github/workflows/inspect-semantic-media.yml'
   workflow_dispatch:
