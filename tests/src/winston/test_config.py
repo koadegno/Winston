@@ -131,3 +131,61 @@ def test_indexing_visual_batch_size_reads_nested_environment(
     monkeypatch.setenv("INDEXING__VISUAL_BATCH_SIZE", "3")
 
     assert Settings().indexing.visual_batch_size == 3
+
+
+def test_search_settings_have_v0_defaults() -> None:
+    """Phase 1F exposes explicit semantic-search defaults as one nested settings object."""
+    assert Settings().model_dump().get("search") == {
+        "result_limit": 10,
+        "candidate_limit": 200,
+        "temporal_context_seconds": 15.0,
+        "moving_average_frames": 3,
+        "timeline_page_size": 256,
+    }
+
+
+def test_search_settings_read_nested_environment_overrides(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SEARCH__ overrides must use the same nested environment convention as other settings."""
+    monkeypatch.setenv("SEARCH__RESULT_LIMIT", "7")
+    monkeypatch.setenv("SEARCH__CANDIDATE_LIMIT", "80")
+    monkeypatch.setenv("SEARCH__TEMPORAL_CONTEXT_SECONDS", "9.5")
+    monkeypatch.setenv("SEARCH__MOVING_AVERAGE_FRAMES", "5")
+    monkeypatch.setenv("SEARCH__TIMELINE_PAGE_SIZE", "64")
+
+    assert Settings().model_dump().get("search") == {
+        "result_limit": 7,
+        "candidate_limit": 80,
+        "temporal_context_seconds": 9.5,
+        "moving_average_frames": 5,
+        "timeline_page_size": 64,
+    }
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("result_limit", 0),
+        ("candidate_limit", 0),
+        ("temporal_context_seconds", 0.0),
+        ("timeline_page_size", 0),
+    ],
+)
+def test_search_settings_reject_non_positive_values(field: str, value: int | float) -> None:
+    """Search limits and temporal context must remain strictly positive."""
+    with pytest.raises(ValidationError):
+        Settings(search={field: value})
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_search_settings_reject_non_finite_temporal_context(value: float) -> None:
+    """Temporal context cannot accept NaN or infinite values."""
+    with pytest.raises(ValidationError):
+        Settings(search={"temporal_context_seconds": value})
+
+
+def test_search_settings_reject_even_moving_average_width() -> None:
+    """A centered moving average requires an odd positive frame width."""
+    with pytest.raises(ValidationError):
+        Settings(search={"moving_average_frames": 4})
