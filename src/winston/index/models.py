@@ -6,6 +6,7 @@ import math
 from pathlib import PurePosixPath
 import re
 from typing import Self
+from uuid import UUID
 
 import numpy as np
 from numpy.typing import NDArray
@@ -38,6 +39,25 @@ class VisualIndexSession:
     """Identity of the exact compatible visual collection used by one indexing run."""
 
     index_instance_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class VisualSearchSession:
+    """Identity of the exact compatible collection opened for one read-only search run."""
+
+    dataset_instance_id: str
+    index_instance_id: str
+
+    def __post_init__(self) -> None:
+        """Reject malformed collection UUID metadata before search orchestration uses it."""
+        for field_name, value in (
+            ("dataset_instance_id", self.dataset_instance_id),
+            ("index_instance_id", self.index_instance_id),
+        ):
+            try:
+                UUID(value)
+            except (AttributeError, TypeError, ValueError) as exc:
+                raise ValueError(f"{field_name} must be a valid UUID") from exc
 
 
 class SampleKind(StrEnum):
@@ -201,3 +221,16 @@ class IndexedVisual(BaseModel):
             )
         if not bool(np.isfinite(self.vector).all()):
             raise ValueError("vector values must all be finite")
+
+
+@dataclass(frozen=True, slots=True)
+class ScoredVisual:
+    """One Winston visual paired with the finite raw cosine score returned by retrieval."""
+
+    visual: IndexedVisual
+    score: float
+
+    def __post_init__(self) -> None:
+        """Reject invalid provider scores before they enter semantic-search orchestration."""
+        if not math.isfinite(self.score):
+            raise ValueError("score must be finite")

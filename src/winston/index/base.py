@@ -1,10 +1,16 @@
 """Public storage-agnostic contract for Winston visual indexes."""
 
-from collections.abc import Sequence
+from collections.abc import AsyncIterator, Sequence
 from typing import Protocol
 
 from winston.embeddings.models import EmbeddingIdentity
-from winston.index.models import IndexedVisual, VisualIndexSession
+from winston.index.models import (
+    IndexedVisual,
+    ScoredVisual,
+    VisualIndexSession,
+    VisualSearchSession,
+    VisualVector,
+)
 
 
 class VisualIndex(Protocol):
@@ -16,6 +22,32 @@ class VisualIndex(Protocol):
         dataset_instance_id: str,
     ) -> VisualIndexSession:
         """Create or validate storage owned by one dataset and embedding identity."""
+        ...
+
+    async def open_search(
+        self,
+        identity: EmbeddingIdentity,
+    ) -> VisualSearchSession:
+        """Validate and open an existing compatible collection for read-only search."""
+        ...
+
+    async def search_visuals(
+        self,
+        query_vector: VisualVector,
+        *,
+        limit: int,
+    ) -> Sequence[ScoredVisual]:
+        """Return coarse nearest-neighbor candidates with raw semantic scores."""
+        ...
+
+    def iter_visuals(
+        self,
+        *,
+        asset_id: str,
+        start_timestamp_us: int,
+        end_timestamp_us: int,
+    ) -> AsyncIterator[IndexedVisual]:
+        """Stream every indexed visual inside one bounded video timestamp interval."""
         ...
 
     async def delete_old_revisions(

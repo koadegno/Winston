@@ -7,9 +7,12 @@ from winston.index.models import (
     IndexedVisual,
     RegionGeometry,
     SampleKind,
+    ScoredVisual,
     VisualIndexConfigurationError,
     VisualIndexError,
     VisualIndexSession,
+    VisualSearchSession,
+    VisualVector,
 )
 
 __all__ = [
@@ -17,10 +20,13 @@ __all__ = [
     "IndexedVisual",
     "RegionGeometry",
     "SampleKind",
+    "ScoredVisual",
     "VisualIndex",
     "VisualIndexConfigurationError",
     "VisualIndexError",
     "VisualIndexSession",
+    "VisualSearchSession",
+    "VisualVector",
     "timestamp_to_microseconds",
     "visual_point_id",
 ]
