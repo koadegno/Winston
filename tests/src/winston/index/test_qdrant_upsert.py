@@ -19,6 +19,7 @@ from winston.ingest.models import MediaType
 from winston.sampling.regions import RegionKind
 
 IDENTITY = EmbeddingIdentity("jinaai/jina-clip-v1", 768, 1)
+DATASET_ID = "8f7ad0c0-7ab7-4ec0-9025-22f40dd70c4a"
 
 
 @dataclass(frozen=True, slots=True)
@@ -134,7 +135,7 @@ async def test_upsert_rejects_mixed_identity_before_first_network_write() -> Non
     """A mixed embedding identity batch must fail atomically before any Qdrant upsert."""
     client = UpsertFakeClient()
     index = QdrantVisualIndex(QdrantSettings(), client=client)
-    await index.ensure_compatible(IDENTITY)
+    await index.ensure_compatible(IDENTITY, DATASET_ID)
     incompatible = EmbeddingIdentity("other-model", 768, 1)
 
     with pytest.raises(VisualIndexConfigurationError, match="embedding identity"):
@@ -153,7 +154,7 @@ async def test_upsert_empty_batch_performs_no_write_after_compatibility() -> Non
     """An empty batch is a no-op only after the index session is established."""
     client = UpsertFakeClient()
     index = QdrantVisualIndex(QdrantSettings(), client=client)
-    await index.ensure_compatible(IDENTITY)
+    await index.ensure_compatible(IDENTITY, DATASET_ID)
 
     await index.upsert([])
 
@@ -165,7 +166,7 @@ async def test_upsert_maps_video_tile_to_named_vector_and_complete_payload() -> 
     """A keyframe tile must preserve exact temporal/spatial provenance without raw media."""
     client = UpsertFakeClient()
     index = QdrantVisualIndex(QdrantSettings(), client=client)
-    await index.ensure_compatible(IDENTITY)
+    await index.ensure_compatible(IDENTITY, DATASET_ID)
     visual = make_video_visual()
 
     await index.upsert([visual])
@@ -207,7 +208,7 @@ async def test_upsert_maps_photo_timestamp_fields_to_null() -> None:
     """A photo payload must explicitly carry null temporal fields and full-frame geometry."""
     client = UpsertFakeClient()
     index = QdrantVisualIndex(QdrantSettings(), client=client)
-    await index.ensure_compatible(IDENTITY)
+    await index.ensure_compatible(IDENTITY, DATASET_ID)
     visual = make_image_visual()
 
     await index.upsert([visual])
@@ -233,7 +234,7 @@ async def test_upsert_splits_writes_into_bounded_sequential_batches() -> None:
     """The default write path must never materialize more than 256 Qdrant points at once."""
     client = UpsertFakeClient()
     index = QdrantVisualIndex(QdrantSettings(upsert_batch_size=256), client=client)
-    await index.ensure_compatible(IDENTITY)
+    await index.ensure_compatible(IDENTITY, DATASET_ID)
     visuals = [make_video_visual(timestamp_seconds=float(index)) for index in range(600)]
 
     await index.upsert(visuals)
@@ -252,7 +253,7 @@ async def test_upsert_uses_configured_collection_vector_and_batch_size() -> None
         upsert_batch_size=2,
     )
     index = QdrantVisualIndex(settings, client=client)
-    await index.ensure_compatible(IDENTITY)
+    await index.ensure_compatible(IDENTITY, DATASET_ID)
 
     await index.upsert(
         [make_video_visual(timestamp_seconds=float(index)) for index in range(3)]
@@ -269,7 +270,7 @@ async def test_upsert_wraps_provider_failure_with_original_cause() -> None:
     failure = RuntimeError("write failed")
     client = UpsertFakeClient(upsert_failure=failure)
     index = QdrantVisualIndex(QdrantSettings(), client=client)
-    await index.ensure_compatible(IDENTITY)
+    await index.ensure_compatible(IDENTITY, DATASET_ID)
 
     with pytest.raises(VisualIndexError, match="upsert") as caught:
         await index.upsert([make_video_visual()])

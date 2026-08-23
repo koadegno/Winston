@@ -11,3 +11,13 @@ class SampledFrame:
     width: int
     height: int
     rgb24: bytes
+
+
+@dataclass(frozen=True, slots=True)
+class SampledImage:
+    """One decoded still image with source provenance and contiguous RGB24 bytes."""
+
+    source_path: Path
+    width: int
+    height: int
+    rgb24: bytes

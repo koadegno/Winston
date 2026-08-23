@@ -54,6 +54,12 @@ class QdrantSettings(BaseSettings):
     upsert_batch_size: PositiveInt = 256
 
 
+class IndexingSettings(BaseSettings):
+    """Settings that bound Winston's high-level indexing orchestration."""
+
+    visual_batch_size: PositiveInt = 9
+
+
 # The engine field is the discriminator, so provider-specific settings cannot be mixed together.
 type EmbeddingSettings = Annotated[
     JinaLocalEmbeddingSettings | JinaApiEmbeddingSettings,
@@ -75,6 +81,7 @@ class Settings(BaseSettings):
     ffprobe_binary: str = "ffprobe"
     embedding: EmbeddingSettings = Field(default_factory=JinaLocalEmbeddingSettings)
     qdrant: QdrantSettings = Field(default_factory=QdrantSettings)
+    indexing: IndexingSettings = Field(default_factory=IndexingSettings)
 
 
 def get_config() -> Settings:

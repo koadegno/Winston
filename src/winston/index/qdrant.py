@@ -3,6 +3,7 @@
 from collections.abc import Sequence
 from itertools import batched
 from typing import Protocol
+from uuid import UUID, uuid4
 
 from qdrant_client import AsyncQdrantClient, models
 
@@ -14,12 +15,13 @@ from winston.index.models import (
     IndexedVisual,
     VisualIndexConfigurationError,
     VisualIndexError,
+    VisualIndexSession,
 )
 
 type CollectionMetadataValue = str | int
 type CollectionMetadata = dict[str, CollectionMetadataValue]
 
-WINSTON_SCHEMA_VERSION = 1
+WINSTON_SCHEMA_VERSION = 2
 VISUAL_DISTANCE = models.Distance.COSINE
 VISUAL_DISTANCE_NAME = "cosine"
 
@@ -44,7 +46,7 @@ class _CollectionInfo(Protocol):
 
 
 class _QdrantClient(Protocol):
-    """Minimal non-destructive Qdrant operations used by Winston's visual index."""
+    """Minimal Qdrant operations used by Winston's visual index."""
 
     async def collection_exists(self, collection_name: str) -> bool:
         """Return whether the configured collection exists."""
@@ -64,6 +66,16 @@ class _QdrantClient(Protocol):
         """Return the collection configuration needed for compatibility validation."""
         ...
 
+    async def delete(
+        self,
+        collection_name: str,
+        *,
+        points_selector: models.FilterSelector,
+        wait: bool,
+    ) -> models.UpdateResult:
+        """Delete points matching one Winston-owned selector."""
+        ...
+
     async def upsert(
         self,
         collection_name: str,
@@ -80,7 +92,7 @@ class _QdrantClient(Protocol):
 
 
 class QdrantVisualIndex:
-    """Strict, non-destructive Qdrant backend for Winston visual embeddings."""
+    """Strict, dataset-owned Qdrant backend for Winston visual embeddings."""
 
     def __init__(
         self,
@@ -93,14 +105,30 @@ class QdrantVisualIndex:
         self._client: _QdrantClient = client or AsyncQdrantClient(url=settings.url)
         self._identity: EmbeddingIdentity | None = None
 
-    async def ensure_compatible(self, identity: EmbeddingIdentity) -> None:
-        """Create or strictly validate the configured visual collection."""
+    async def ensure_compatible(
+        self,
+        identity: EmbeddingIdentity,
+        dataset_instance_id: str,
+    ) -> VisualIndexSession:
+        """Create or strictly validate one dataset-owned visual collection."""
+        try:
+            canonical_dataset_id = str(UUID(dataset_instance_id))
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise VisualIndexConfigurationError(
+                f"dataset_instance_id must be a UUID, got {dataset_instance_id!r}"
+            ) from exc
+
         try:
             exists = await self._client.collection_exists(self._settings.collection)
             if exists:
                 info = await self._client.get_collection(self._settings.collection)
-                self._validate_collection(info, identity)
+                index_instance_id = self._validate_collection(
+                    info,
+                    identity,
+                    canonical_dataset_id,
+                )
             else:
+                index_instance_id = str(uuid4())
                 created = await self._client.create_collection(
                     self._settings.collection,
                     vectors_config={
@@ -109,15 +137,17 @@ class QdrantVisualIndex:
                             distance=VISUAL_DISTANCE,
                         )
                     },
-                    metadata=self._collection_metadata(identity),
+                    metadata=self._collection_metadata(
+                        identity,
+                        dataset_instance_id=canonical_dataset_id,
+                        index_instance_id=index_instance_id,
+                    ),
                 )
                 if not created:
                     raise VisualIndexError(
                         f"Qdrant did not create visual index collection '{self._settings.collection}'"
                     )
-        except IncompatibleVisualIndexError:
-            raise
-        except VisualIndexError:
+        except (IncompatibleVisualIndexError, VisualIndexConfigurationError, VisualIndexError):
             raise
         except Exception as exc:
             raise VisualIndexError(
@@ -125,6 +155,47 @@ class QdrantVisualIndex:
             ) from exc
 
         self._identity = identity
+        return VisualIndexSession(index_instance_id=index_instance_id)
+
+    async def delete_old_revisions(
+        self,
+        *,
+        source_path: str,
+        current_asset_id: str,
+    ) -> None:
+        """Delete older revisions for one source path before indexing its replacement."""
+        if self._identity is None:
+            raise VisualIndexConfigurationError(
+                "ensure_compatible() must succeed before old revisions can be deleted"
+            )
+
+        selector = models.FilterSelector(
+            filter=models.Filter(
+                must=[
+                    models.FieldCondition(
+                        key="source_path",
+                        match=models.MatchValue(value=source_path),
+                    )
+                ],
+                must_not=[
+                    models.FieldCondition(
+                        key="asset_id",
+                        match=models.MatchValue(value=current_asset_id),
+                    )
+                ],
+            )
+        )
+        try:
+            await self._client.delete(
+                self._settings.collection,
+                points_selector=selector,
+                wait=True,
+            )
+        except Exception as exc:
+            raise VisualIndexError(
+                f"Failed to delete old visual revisions for {source_path} "
+                f"from collection '{self._settings.collection}'"
+            ) from exc
 
     async def upsert(self, visuals: Sequence[IndexedVisual]) -> None:
         """Validate then idempotently upsert visual candidates in bounded sequential batches."""
@@ -167,8 +238,9 @@ class QdrantVisualIndex:
         self,
         info: _CollectionInfo,
         identity: EmbeddingIdentity,
-    ) -> None:
-        """Reject any actual vector or Winston metadata incompatibility."""
+        dataset_instance_id: str,
+    ) -> str:
+        """Reject vector, embedding, or dataset ownership incompatibility and return its instance ID."""
         vectors = info.config.params.vectors
         if not isinstance(vectors, dict) or self._settings.vector_name not in vectors:
             raise IncompatibleVisualIndexError(
@@ -199,7 +271,15 @@ class QdrantVisualIndex:
                 "Winston metadata is missing. Explicit reindexing is required."
             )
 
-        expected_metadata = self._collection_metadata(identity)
+        expected_metadata: CollectionMetadata = {
+            "winston_schema_version": WINSTON_SCHEMA_VERSION,
+            "dataset_instance_id": dataset_instance_id,
+            "model_id": identity.model_id,
+            "dimension": identity.dimension,
+            "preprocessing_version": identity.preprocessing_version,
+            "vector_name": self._settings.vector_name,
+            "distance": VISUAL_DISTANCE_NAME,
+        }
         for field, expected in expected_metadata.items():
             if field not in actual_metadata:
                 raise IncompatibleVisualIndexError(
@@ -215,10 +295,34 @@ class QdrantVisualIndex:
                     "Explicit reindexing is required."
                 )
 
-    def _collection_metadata(self, identity: EmbeddingIdentity) -> CollectionMetadata:
-        """Build the required Winston-owned collection compatibility metadata."""
+        raw_instance_id = actual_metadata.get("index_instance_id")
+        if not isinstance(raw_instance_id, str):
+            raise IncompatibleVisualIndexError(
+                f"Incompatible visual index collection '{self._settings.collection}': "
+                "required metadata field 'index_instance_id' is missing or invalid. "
+                "Explicit reindexing is required."
+            )
+        try:
+            return str(UUID(raw_instance_id))
+        except ValueError as exc:
+            raise IncompatibleVisualIndexError(
+                f"Incompatible visual index collection '{self._settings.collection}': "
+                "metadata field 'index_instance_id' is not a UUID. "
+                "Explicit reindexing is required."
+            ) from exc
+
+    def _collection_metadata(
+        self,
+        identity: EmbeddingIdentity,
+        *,
+        dataset_instance_id: str,
+        index_instance_id: str,
+    ) -> CollectionMetadata:
+        """Build the required Winston schema-v2 ownership and compatibility metadata."""
         return {
             "winston_schema_version": WINSTON_SCHEMA_VERSION,
+            "dataset_instance_id": dataset_instance_id,
+            "index_instance_id": index_instance_id,
             "model_id": identity.model_id,
             "dimension": identity.dimension,
             "preprocessing_version": identity.preprocessing_version,
