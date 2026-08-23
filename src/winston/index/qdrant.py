@@ -123,7 +123,7 @@ class _QdrantClient(Protocol):
         using: str,
         limit: int,
         with_payload: bool,
-        with_vectors: bool,
+        with_vectors: list[str],
     ) -> models.QueryResponse:
         """Return coarse semantic nearest neighbors for one dense query vector."""
         ...
@@ -294,7 +294,7 @@ class QdrantVisualIndex:
                 using=self._settings.vector_name,
                 limit=limit,
                 with_payload=True,
-                with_vectors=True,
+                with_vectors=[self._settings.vector_name],
             )
             return tuple(
                 self._scored_visual_from_point(point, identity)
