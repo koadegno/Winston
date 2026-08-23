@@ -1,11 +1,12 @@
 name: Semantic search temporary validation
 
 on:
-  push:
+  pull_request:
     branches:
-      - test/semantic-search-validation
+      - feat/semantic-search-cli
     paths:
       - '.github/workflows/semantic-search-validation.yml'
+  workflow_dispatch:
 
 permissions:
   contents: read
