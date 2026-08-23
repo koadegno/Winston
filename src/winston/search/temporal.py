@@ -55,12 +55,31 @@ class TemporalWindow:
             raise ValueError("temporal window start must be <= end")
 
 
+@dataclass(frozen=True, slots=True)
+class SelectedPassage:
+    """One sampled video interval selected from a locally normalized semantic signal."""
+
+    start_timestamp_us: int
+    end_timestamp_us: int
+    representative: ScoredVisual
+
+    def __post_init__(self) -> None:
+        """Require the representative keyframe to lie inside the sampled passage boundaries."""
+        timestamp_us = self.representative.visual.timestamp_us
+        if timestamp_us is None:
+            raise ValueError("selected passage representative must be a timestamped video visual")
+        if self.start_timestamp_us < 0 or self.end_timestamp_us < self.start_timestamp_us:
+            raise ValueError("selected passage timestamps must be non-negative and ordered")
+        if not self.start_timestamp_us <= timestamp_us <= self.end_timestamp_us:
+            raise ValueError("selected passage representative must lie inside the passage")
+
+
 def cosine_similarity(query: VisualVector, candidate: VisualVector) -> float:
     """Return exact cosine similarity for two finite non-zero dense visual vectors.
 
-    This deliberately returns the mathematical cosine value unchanged.  A value such
+    This deliberately returns the mathematical cosine value unchanged. A value such
     as ``0.61`` stays ``0.61``; it is not clamped or presented as a confidence
-    percentage.  Qdrant ANN finds promising neighborhoods, while this function is the
+    percentage. Qdrant ANN finds promising neighborhoods, while this function is the
     exact local score used after every vector in a candidate window has been fetched.
     """
     if query.ndim != 1 or candidate.ndim != 1:
@@ -94,7 +113,7 @@ def collapse_best_by_timestamp(
 
     Example: if the full frame and three tiles at 12s score ``0.27``, ``0.31``,
     ``0.61`` and ``0.29``, the timestamp contributes exactly ``0.61`` and keeps the
-    region that produced that score.  This prevents a tiled keyframe from getting more
+    region that produced that score. This prevents a tiled keyframe from getting more
     temporal votes merely because it generated more indexed regions.
     """
     best: dict[tuple[str, int], ScoredVisual] = {}
@@ -122,11 +141,11 @@ def build_temporal_windows(
     """Expand coarse seeds by context and merge touching windows within each asset.
 
     With a 15-second context, seeds at ``100s``, ``108s`` and ``310s`` first become
-    ``85..115``, ``93..123`` and ``295..325``.  The first two overlap, so Winston
+    ``85..115``, ``93..123`` and ``295..325``. The first two overlap, so Winston
     retrieves two complete neighborhoods: ``85..123`` and ``295..325``.
 
     ``context_seconds`` is therefore a semantic parameter: changing it can change
-    which sampled moments are grouped into one passage.  In contrast, ANN candidate
+    which sampled moments are grouped into one passage. In contrast, ANN candidate
     count and Qdrant timeline page size primarily bound discovery/runtime cost.
     """
     if not math.isfinite(context_seconds) or context_seconds <= 0.0:
@@ -179,6 +198,199 @@ def build_temporal_windows(
     return tuple(merged)
 
 
+def centered_moving_average(
+    values: Sequence[float],
+    *,
+    width: int,
+) -> tuple[float, ...]:
+    """Smooth a sequence with a centered odd-width window and partial edge windows.
+
+    For width 3, ``[1, 2, 3, 4, 5]`` becomes ``[1.5, 2, 3, 4, 4.5]``: an interior
+    sample uses previous/current/next, while the first and last samples use only
+    neighbors that actually exist. Smoothing only shapes temporal interval selection;
+    it never replaces the representative raw cosine used for global result ranking.
+    """
+    if isinstance(width, bool) or not isinstance(width, int) or width <= 0 or width % 2 == 0:
+        raise ValueError("moving-average width must be a positive odd integer")
+    numeric = tuple(float(value) for value in values)
+    if not all(math.isfinite(value) for value in numeric):
+        raise ValueError("moving-average values must all be finite")
+    if not numeric:
+        return ()
+
+    prefix = [0.0]
+    for value in numeric:
+        prefix.append(prefix[-1] + value)
+
+    radius = width // 2
+    smoothed: list[float] = []
+    for index in range(len(numeric)):
+        start = max(0, index - radius)
+        end = min(len(numeric), index + radius + 1)
+        smoothed.append((prefix[end] - prefix[start]) / (end - start))
+    return tuple(smoothed)
+
+
+def population_z_scores(values: Sequence[float]) -> tuple[float, ...] | None:
+    """Normalize one local sequence using population variance, or return None if flat.
+
+    The z-scores are an internal relative signal, not user-facing confidence. They
+    answer only "which sampled moments are high compared with this candidate window?".
+    ``ddof=0`` is intentional because the complete retrieved local window is treated as
+    the population being normalized rather than as a statistical sample of a dataset.
+    """
+    numeric = tuple(float(value) for value in values)
+    if not all(math.isfinite(value) for value in numeric):
+        raise ValueError("z-score values must all be finite")
+    if not numeric:
+        return ()
+
+    mean = sum(numeric) / len(numeric)
+    variance = sum((value - mean) ** 2 for value in numeric) / len(numeric)
+    scale = max(1.0, *(abs(value) for value in numeric))
+    near_zero_std = np.finfo(np.float64).eps * scale * 32.0
+    standard_deviation = math.sqrt(variance)
+    if standard_deviation <= near_zero_std:
+        return None
+    return tuple((value - mean) / standard_deviation for value in numeric)
+
+
+def maximum_subarray(values: Sequence[float]) -> tuple[int, int] | None:
+    """Return inclusive indices of the strongest positive contiguous numerical signal.
+
+    This is Kadane's algorithm with deterministic ties: larger sum wins; for equal
+    sums the shorter range wins; for equal sum and length the earlier start wins.
+    Example ``[-0.8, -0.3, 1.2, 1.5, 0.9, -0.2, -1.0]`` selects indices ``2..4``.
+    Kadane knows nothing about images or events: it only finds a contiguous positive
+    run in the already-smoothed, locally-normalized numerical sequence.
+    """
+    numeric = tuple(float(value) for value in values)
+    if not all(math.isfinite(value) for value in numeric):
+        raise ValueError("maximum-subarray values must all be finite")
+
+    best_sum = 0.0
+    best_start: int | None = None
+    best_end: int | None = None
+    current_sum = 0.0
+    current_start = 0
+
+    for index, value in enumerate(numeric):
+        # If the prior prefix is zero or negative, restarting here has the same or a
+        # better sum and is strictly shorter when equal.
+        if current_sum <= 0.0:
+            current_sum = value
+            current_start = index
+        else:
+            current_sum += value
+
+        if current_sum <= 0.0:
+            continue
+        if best_start is None or best_end is None:
+            best_sum = current_sum
+            best_start = current_start
+            best_end = index
+            continue
+
+        current_length = index - current_start + 1
+        best_length = best_end - best_start + 1
+        if _strictly_greater(current_sum, best_sum):
+            best_sum = current_sum
+            best_start = current_start
+            best_end = index
+        elif _sums_equal(current_sum, best_sum) and (
+            current_length < best_length
+            or (current_length == best_length and current_start < best_start)
+        ):
+            best_sum = current_sum
+            best_start = current_start
+            best_end = index
+
+    if best_start is None or best_end is None:
+        return None
+    return best_start, best_end
+
+
+def select_passage(
+    observations: Sequence[TemporalObservation],
+    *,
+    moving_average_frames: int,
+) -> SelectedPassage:
+    """Select one contiguous sampled passage while preserving a representative raw hit.
+
+    The sequence is sorted by exact integer ``timestamp_us``. Fewer than three samples
+    cannot establish a sustained signal, and a zero/near-zero z-score variance carries
+    no relative evidence; both cases fall back to the strongest raw observation.
+    Otherwise Winston smooths raw cosine values, computes local population z-scores,
+    and runs Kadane to choose passage extent. The representative is still the strongest
+    *raw* semantic match inside that extent, so normalization never becomes confidence.
+    """
+    if not observations:
+        raise ValueError("select_passage requires at least one temporal observation")
+
+    ordered = tuple(sorted(observations, key=lambda observation: observation.timestamp_us))
+    first_visual = ordered[0].match.visual
+    stream_identity = (first_visual.asset_id, first_visual.source_path)
+    seen_timestamps: set[int] = set()
+    for observation in ordered:
+        visual = observation.match.visual
+        if (visual.asset_id, visual.source_path) != stream_identity:
+            raise ValueError("select_passage observations must belong to one video stream")
+        if observation.timestamp_us in seen_timestamps:
+            raise ValueError("select_passage observations must have unique timestamps")
+        seen_timestamps.add(observation.timestamp_us)
+
+    # Validate the configured width even when a short sequence immediately falls back.
+    centered_moving_average((), width=moving_average_frames)
+    if len(ordered) < 3:
+        return _raw_fallback(ordered)
+
+    raw_scores = tuple(observation.match.score for observation in ordered)
+    smoothed = centered_moving_average(raw_scores, width=moving_average_frames)
+    normalized = population_z_scores(smoothed)
+    if normalized is None:
+        return _raw_fallback(ordered)
+
+    selected = maximum_subarray(normalized)
+    if selected is None:
+        return _raw_fallback(ordered)
+    start_index, end_index = selected
+    selected_observations = ordered[start_index : end_index + 1]
+    representative = min(selected_observations, key=_observation_order_key).match
+    return SelectedPassage(
+        start_timestamp_us=ordered[start_index].timestamp_us,
+        end_timestamp_us=ordered[end_index].timestamp_us,
+        representative=representative,
+    )
+
+
+def _raw_fallback(observations: Sequence[TemporalObservation]) -> SelectedPassage:
+    """Return one exact sampled moment using strongest raw score then deterministic provenance."""
+    representative_observation = min(observations, key=_observation_order_key)
+    timestamp_us = representative_observation.timestamp_us
+    return SelectedPassage(
+        start_timestamp_us=timestamp_us,
+        end_timestamp_us=timestamp_us,
+        representative=representative_observation.match,
+    )
+
+
+def _observation_order_key(
+    observation: TemporalObservation,
+) -> tuple[float, int, str, str, int, int, int, int]:
+    """Prefer higher raw score, then earlier timestamp and deterministic visual provenance."""
+    match_key = _match_order_key(observation.match)
+    return (
+        match_key[0],
+        observation.timestamp_us,
+        match_key[1],
+        match_key[2],
+        match_key[3],
+        match_key[4],
+        match_key[5],
+        match_key[6],
+    )
+
+
 def _match_order_key(match: ScoredVisual) -> tuple[float, str, str, int, int, int, int]:
     """Return a stable key that prefers higher score then deterministic region provenance."""
     visual = match.visual
@@ -192,3 +404,13 @@ def _match_order_key(match: ScoredVisual) -> tuple[float, str, str, int, int, in
         region.width,
         region.height,
     )
+
+
+def _sums_equal(left: float, right: float) -> bool:
+    """Treat only machine-scale rounding differences as equal Kadane sums."""
+    return math.isclose(left, right, rel_tol=1e-12, abs_tol=1e-12)
+
+
+def _strictly_greater(left: float, right: float) -> bool:
+    """Return whether one Kadane sum is meaningfully larger rather than rounding noise."""
+    return left > right and not _sums_equal(left, right)
