@@ -6,6 +6,7 @@ on:
       - test/semantic-search-media-inspection
     paths:
       - '.github/workflows/inspect-semantic-media.yml'
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -57,12 +58,16 @@ jobs:
             } >> "$output/videos-info.txt"
 
             ffmpeg -hide_banner -loglevel error -i "$video" \
-              -vf "fps=12/${duration},scale=320:-2,tile=4x3" \
+              -vf "fps=12/${duration},scale=320:-2,drawtext=text='%{pts\\:hms}':x=8:y=8:fontsize=18:fontcolor=white:box=1:boxcolor=black@0.55,tile=4x3" \
               -frames:v 1 "$output/contact-sheets/${safe}.jpg"
           done < <(find "$work/videos" -type f \( -iname '*.mkv' -o -iname '*.mp4' -o -iname '*.mov' -o -iname '*.avi' \) -print0 | sort -z)
 
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
           git add "$output/videos-info.txt" "$output/contact-sheets"
+          if git diff --cached --quiet; then
+            echo 'No inspection outputs changed.'
+            exit 0
+          fi
           git commit -m 'test: inspect semantic search release videos'
           git push origin HEAD:test/semantic-search-media-inspection
