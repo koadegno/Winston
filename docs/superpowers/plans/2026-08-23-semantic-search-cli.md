@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Implement GitHub issue #10 by adding `winston search QUERY [--limit N]`, using Jina CLIP text embeddings plus Qdrant coarse retrieval and bounded temporal grouping inspired by the Semantic File Explorer reference algorithm.
+**Goal:** Implement GitHub issue #10 by adding `winston search QUERY [--limit N]`, using Jina CLIP text embeddings, Qdrant coarse retrieval, and bounded temporal grouping inspired by the Semantic File Explorer reference algorithm.
 
-**Architecture:** Keep `cli.py` thin. Extend Winston's `VisualIndex` boundary with read-only retrieval methods, then add a dedicated `winston.search` package. Global candidate discovery stays ANN through Qdrant; video candidates are refined only inside bounded temporal neighborhoods by rescoring all already-indexed regions, collapsing to one score per keyframe, applying a centered moving average, population z-score normalization, and Kadane maximum-subarray selection. Cross-result ranking always uses the representative raw cosine similarity, never a fabricated confidence percentage.
+**Architecture:** Keep `cli.py` thin. Extend Winston's `VisualIndex` boundary with read-only retrieval methods, then add a dedicated `winston.search` package. Global candidate discovery remains ANN through Qdrant. Video candidates are refined only inside bounded temporal neighborhoods by rescoring all already-indexed regions, collapsing to one score per keyframe, applying a centered moving average, population z-score normalization, and Kadane maximum-subarray selection. Cross-result ranking always uses the representative raw cosine similarity, never a fabricated confidence percentage.
 
 **Tech Stack:** Python 3.13+, argparse, asyncio, NumPy, Pydantic/Pydantic Settings, existing Jina CLIP v1 embedding engines, qdrant-client 1.18.x, Qdrant 1.18.2, pytest, pytest-asyncio, GitHub Actions.
 
@@ -13,11 +13,29 @@
 ## Global Constraints
 
 - Implement only GitHub issue #10 / Phase 1F. Dense intermediate-frame decoding remains Phase 2.
-- The implementation stays in one draft PR titled `feat: add semantic search CLI`; PR body includes `Closes #10`.
+- The implementation stays in one draft PR titled `feat: add semantic search CLI`; the PR body contains `Closes #10`.
 - Do not merge or delete `feat/semantic-search-cli` without explicit user approval.
-- For Winston, do not use Mac Studio / local MCP execution. Validation happens through GitHub and GitHub Actions.
-- Temporary validation workflows/branches are allowed only for testing; remove them after successful validation.
-- Follow strict TDD for every implementation task: failing test -> verify RED -> minimal implementation -> verify GREEN -> coherent commit.
+- For Winston, do not use Mac Studio / local MCP execution. All test execution happens through GitHub Actions.
+- Temporary validation workflows/branches are allowed only for testing and must be removed after successful validation.
+- Follow strict GitHub-only TDD for every implementation task:
+
+```text
+write focused failing tests
+        ↓
+commit/push test contract (`test: ...`)
+        ↓
+GitHub Action proves RED for the intended reason
+        ↓
+implement minimal behavior
+        ↓
+commit/push implementation (`feat:` / `fix:`)
+        ↓
+GitHub Action proves GREEN
+        ↓
+next task
+```
+
+- A RED run must fail because the new behavior is absent, not because of syntax/import/workflow mistakes.
 - Do not introduce `typing.Any` or `object` in new Winston production code or new Phase 1F tests. Use concrete domain/Qdrant types and narrow `Protocol`s.
 - Every new function/method gets a useful docstring. Non-obvious temporal math gets concise comments/docstrings with numeric examples.
 - In particular, document with examples:
@@ -90,15 +108,9 @@ tests/src/winston/search/.gitkeep
 
 ---
 
-## Task 1: Add search configuration and user-facing result models
+## Task 1: Search configuration and user-facing result models
 
-**Files:**
-- Modify: `src/winston/config.py`
-- Create: `src/winston/search/models.py`
-- Modify: `src/winston/search/__init__.py`
-- Modify: `tests/src/winston/test_config.py`
-- Create: `tests/src/winston/search/test_models.py`
-- Delete: `tests/src/winston/search/.gitkeep`
+**Files:** `src/winston/config.py`, `src/winston/search/models.py`, `src/winston/search/__init__.py`, `tests/src/winston/test_config.py`, `tests/src/winston/search/test_models.py`.
 
 **Interfaces:**
 
@@ -106,7 +118,7 @@ tests/src/winston/search/.gitkeep
 class SearchSettings(BaseSettings):
     result_limit: PositiveInt = 10
     candidate_limit: PositiveInt = 200
-    temporal_context_seconds: Annotated[float, Field(gt=0)] = 15.0
+    temporal_context_seconds: Annotated[FiniteFloat, Field(gt=0)] = 15.0
     moving_average_frames: PositiveInt = 3
     timeline_page_size: PositiveInt = 256
 
@@ -125,24 +137,18 @@ class SearchResult(BaseModel):
     raw_score: float
 ```
 
-- [ ] **Step 1: Write failing config tests** for all defaults, nested `SEARCH__...` overrides, non-positive values, non-finite/non-positive context, and rejection of even `moving_average_frames`.
-- [ ] **Step 2: Run `uv run pytest tests/src/winston/test_config.py -q` and verify RED.**
-- [ ] **Step 3: Implement `SearchSettings`** using the existing nested Pydantic settings convention. Add a field validator requiring an odd moving-average width. Do not add direct environment reads.
-- [ ] **Step 4: Run config tests and verify GREEN.**
-- [ ] **Step 5: Write failing `SearchResult` tests** covering image timestamps all `None`, video timestamps all present, `start <= representative <= end`, finite raw score, normalized source path, and invalid mixed image/video timestamp state.
-- [ ] **Step 6: Implement the strict frozen result model and `SearchRunError`.** Reuse Winston-owned `MediaType`, `RegionKind`, and `RegionGeometry` rather than duplicating validation.
-- [ ] **Step 7: Run focused tests and verify GREEN.**
-- [ ] **Step 8: Commit:** `feat: add semantic search configuration and result models`.
+- [ ] Write config tests for defaults, nested `SEARCH__...` overrides, non-positive counts/context, non-finite context, and even `moving_average_frames` rejection.
+- [ ] Commit the tests as `test: define semantic search configuration contracts`; run the focused GitHub Action and verify intended RED.
+- [ ] Implement `SearchSettings` with the existing nested Pydantic settings convention and an odd-width validator; no direct environment reads.
+- [ ] Add tests for strict/frozen `SearchResult`: image timestamps all `None`; video timestamps all present; `start <= representative <= end`; finite raw score; normalized path; invalid mixed state rejected.
+- [ ] Implement result validation by reusing `MediaType`, `RegionKind`, and `RegionGeometry`.
+- [ ] Commit as `feat: add semantic search configuration and result models`; verify focused Action GREEN.
 
 ---
 
-## Task 2: Add Winston-owned read/search contracts to the visual index
+## Task 2: Winston-owned visual-index search contracts
 
-**Files:**
-- Modify: `src/winston/index/base.py`
-- Modify: `src/winston/index/models.py`
-- Modify: `src/winston/index/__init__.py`
-- Create: `tests/src/winston/index/test_qdrant_search.py` with only contract/model tests in this task
+**Files:** `src/winston/index/base.py`, `src/winston/index/models.py`, `src/winston/index/__init__.py`, `tests/src/winston/index/test_qdrant_search.py`.
 
 **Interfaces:**
 
@@ -179,25 +185,20 @@ class VisualIndex(Protocol):
 
 Existing indexing methods remain unchanged.
 
-- [ ] **Step 1: Write failing tests** for finite `ScoredVisual.score` and exported read-session/search types.
-- [ ] **Step 2: Run focused tests and verify RED.**
-- [ ] **Step 3: Add the Winston-owned types and extend `VisualIndex`.** Validate both session UUID strings and finite scores without importing Qdrant types into the domain layer.
-- [ ] **Step 4: Run focused tests and existing index tests; verify GREEN.**
-- [ ] **Step 5: Commit:** `feat: define visual search index contracts`.
+- [ ] Write tests for UUID-valid search-session identities, finite `ScoredVisual.score`, and public exports/protocol shape.
+- [ ] Commit `test: define visual search index contracts`; verify intended RED in Actions.
+- [ ] Implement the Winston-owned types and extend `VisualIndex`, without importing Qdrant types into domain modules.
+- [ ] Commit `feat: define visual search index contracts`; run index/search focused tests in Actions and require GREEN.
 
 ---
 
-## Task 3: Implement read-only Qdrant opening and coarse ANN retrieval
+## Task 3: Read-only Qdrant opening and coarse ANN retrieval
 
-**Files:**
-- Modify: `src/winston/index/qdrant.py`
-- Extend: `tests/src/winston/index/test_qdrant_search.py`
+**Files:** `src/winston/index/qdrant.py`, `tests/src/winston/index/test_qdrant_search.py`.
 
-**Behavior:**
+`open_search(identity)` must require an existing collection, validate schema v2/vector name/dimension/cosine/model/preprocessing metadata, validate stored dataset/index instance UUIDs, set the accepted embedding identity, and return a `VisualSearchSession`. A missing collection raises an actionable error saying media must be indexed first. No mutating Qdrant operation may be called.
 
-`open_search(identity)` must require an existing collection, validate schema v2/vector name/dimension/cosine/model/preprocessing metadata, validate stored dataset/index instance UUIDs, set the accepted embedding identity, and return a `VisualSearchSession`. A missing collection must raise an actionable Winston error mentioning that media must be indexed first. No mutation method may be called.
-
-`search_visuals(query_vector, limit=...)` uses Qdrant 1.18 `query_points` with:
+`search_visuals()` uses Qdrant 1.18 `query_points` with:
 
 ```text
 query         = dense query vector
@@ -207,22 +208,18 @@ with_payload  = True
 with_vectors  = [configured vector name]
 ```
 
-- [ ] **Step 1: Add a fully typed fake Qdrant client and failing tests** for missing collection, successful schema-v2 read-only open, every compatibility mismatch, invalid UUID metadata, and proof that search opening never calls collection creation.
-- [ ] **Step 2: Run the new Qdrant search tests and verify RED.**
-- [ ] **Step 3: Refactor collection validation only as much as needed** so indexing still validates dataset ownership while search validates stored ownership without a caller-provided dataset ID.
-- [ ] **Step 4: Implement `open_search()` and verify GREEN.**
-- [ ] **Step 5: Add failing coarse-query tests** checking exact `query_points` arguments, positive limit validation, float32 finite query-vector/dimension validation, image/video payload reconstruction, named-vector extraction, finite score validation, missing/malformed payload or vector rejection, and provider-error wrapping.
-- [ ] **Step 6: Implement Qdrant -> Winston mapping** by reconstructing strict `IndexedVisual` values from payload + stored vector + the already accepted `EmbeddingIdentity`, then wrap them as `ScoredVisual`.
-- [ ] **Step 7: Run all index adapter tests and verify GREEN.**
-- [ ] **Step 8: Commit:** `feat: add read-only Qdrant semantic retrieval`.
+- [ ] Add a fully typed fake Qdrant client and tests for missing collection, successful read-only open, every compatibility mismatch, invalid UUID metadata, and proof that no collection-creation path is used.
+- [ ] Add coarse-query tests for exact `query_points` arguments, positive limit, float32 finite dimension-valid query vector, image/video payload reconstruction, named-vector extraction, finite score, malformed payload/vector rejection, and provider-error wrapping.
+- [ ] Commit `test: define Qdrant semantic retrieval contracts`; verify intended RED in Actions.
+- [ ] Refactor collection validation only as needed to share compatibility checks while keeping indexing's dataset-ownership validation intact.
+- [ ] Implement `open_search()` and `search_visuals()`, reconstructing strict `IndexedVisual` + `ScoredVisual` values at the adapter boundary.
+- [ ] Commit `feat: add read-only Qdrant semantic retrieval`; require all index adapter tests GREEN.
 
 ---
 
-## Task 4: Implement bounded filtered retrieval for complete video neighborhoods
+## Task 4: Bounded filtered retrieval for complete video neighborhoods
 
-**Files:**
-- Modify: `src/winston/index/qdrant.py`
-- Extend: `tests/src/winston/index/test_qdrant_search.py`
+**Files:** `src/winston/index/qdrant.py`, `tests/src/winston/index/test_qdrant_search.py`.
 
 The iterator uses Qdrant filtered scroll/pagination over:
 
@@ -233,21 +230,18 @@ timestamp_us >= start_timestamp_us
 timestamp_us <= end_timestamp_us
 ```
 
-with payload + the configured named vector requested on every page.
+and requests payload + the configured named vector on every page.
 
-- [ ] **Step 1: Add failing typed-fake tests** proving the exact asset/media/time filter, configured named vector retrieval, page-size bound, continuation-offset propagation, multi-page yielding, invalid range/page-size rejection, and wrapped provider failures.
-- [ ] **Step 2: Run focused tests and verify RED.**
-- [ ] **Step 3: Implement `iter_visuals()` as an async iterator.** Yield strict `IndexedVisual` records page-by-page; do not accumulate every Qdrant record before yielding.
-- [ ] **Step 4: Run focused + existing index tests and verify GREEN.**
-- [ ] **Step 5: Commit:** `feat: add bounded visual timeline retrieval`.
+- [ ] Write typed-fake tests for the exact filter, named-vector request, `page_size`, continuation offset, multi-page yielding, invalid ranges/page sizes, and wrapped provider failures.
+- [ ] Commit `test: define bounded visual timeline retrieval`; verify intended RED.
+- [ ] Implement `iter_visuals()` as an async iterator that yields strict `IndexedVisual` records page-by-page without accumulating the complete Qdrant result set.
+- [ ] Commit `feat: add bounded visual timeline retrieval`; require focused + existing index tests GREEN.
 
 ---
 
-## Task 5: Implement temporal seed collapse, candidate windows, and exact cosine scoring
+## Task 5: Exact cosine, timestamp collapse, and temporal candidate windows
 
-**Files:**
-- Create: `src/winston/search/temporal.py`
-- Create/extend: `tests/src/winston/search/test_temporal.py`
+**Files:** `src/winston/search/temporal.py`, `tests/src/winston/search/test_temporal.py`.
 
 **Interfaces:**
 
@@ -275,21 +269,18 @@ def build_temporal_windows(
 ) -> tuple[TemporalWindow, ...]: ...
 ```
 
-- [ ] **Step 1: Write failing cosine tests** using known vectors; reject wrong dimensions, non-finite values, and zero-norm vectors.
-- [ ] **Step 2: Verify RED, implement exact cosine, verify GREEN.**
-- [ ] **Step 3: Write failing timestamp-collapse tests** with the concrete documentation example `full=0.27`, `tile1=0.31`, `tile2=0.61`, `tile3=0.29` at the same timestamp; expected score/representative is tile2 at `0.61`.
-- [ ] **Step 4: Write failing window tests** using coarse timestamps `100s`, `108s`, `310s` with 15-second context; expected merged windows are `85..123s` and `295..325s`. Also cover different assets, touching windows, and clipping below zero.
-- [ ] **Step 5: Implement collapse/window logic with those examples in docstrings/comments.** Explain that `temporal_context_seconds` can change semantic grouping, while `candidate_limit` and `timeline_page_size` do not define the math of one already-selected neighborhood.
-- [ ] **Step 6: Run temporal tests and verify GREEN.**
-- [ ] **Step 7: Commit:** `feat: build semantic temporal candidate windows`.
+- [ ] Write cosine tests with known vectors; reject wrong dimensions, non-finite vectors, and zero-norm vectors.
+- [ ] Write timestamp-collapse tests using the documentation example: at one keyframe `full=0.27`, `tile1=0.31`, `tile2=0.61`, `tile3=0.29`; expected temporal score/representative is tile2 at `0.61`.
+- [ ] Write window tests using coarse timestamps `100s`, `108s`, `310s` with 15-second context; expected merged windows are `85..123s` and `295..325s`. Cover separate assets, touching windows, and clipping at zero.
+- [ ] Commit `test: define semantic temporal candidate windows`; verify intended RED.
+- [ ] Implement exact cosine + collapse + merging. Put the numeric examples in docstrings/comments. Explain that `temporal_context_seconds` can change grouping, whereas `candidate_limit`/`timeline_page_size` primarily bound discovery/runtime cost.
+- [ ] Commit `feat: build semantic temporal candidate windows`; require temporal tests GREEN.
 
 ---
 
-## Task 6: Implement moving average, z-score, Kadane, and passage selection
+## Task 6: Moving average, z-score, Kadane, and passage selection
 
-**Files:**
-- Modify: `src/winston/search/temporal.py`
-- Extend: `tests/src/winston/search/test_temporal.py`
+**Files:** `src/winston/search/temporal.py`, `tests/src/winston/search/test_temporal.py`.
 
 **Interfaces:**
 
@@ -311,31 +302,26 @@ def select_passage(
 ) -> SelectedPassage: ...
 ```
 
-- [ ] **Step 1: Write failing centered-moving-average tests.** The docstring/example must show width 3 explicitly: at an interior point use previous/current/next score; at the first/last point use only available values.
-- [ ] **Step 2: Verify RED, implement moving average, verify GREEN.** State in the docstring that smoothing changes interval selection but never replaces the raw cosine score shown/ranked to users.
-- [ ] **Step 3: Write failing population-z-score tests** with deterministic values and zero-variance fallback. Document that z-score compares a keyframe to its local neighborhood and is not a calibrated confidence.
-- [ ] **Step 4: Verify RED, implement z-score, verify GREEN.**
-- [ ] **Step 5: Write failing Kadane tests** for normal selection, all-non-positive fallback, equal-sum shorter-interval tie-break, and equal-length earlier-start tie-break. Include a simple numeric example such as `[-0.8, -0.3, 1.2, 1.5, 0.9, -0.2, -1.0]`, whose strongest positive contiguous interval is `1.2, 1.5, 0.9`.
-- [ ] **Step 6: Verify RED, implement Kadane, verify GREEN.** Explain in code that Kadane only finds a contiguous numerical signal; it has no knowledge of images/events.
-- [ ] **Step 7: Add failing passage-selection tests** for fewer than three timestamps, zero variance, sustained cluster vs isolated spike, exact selected keyframe boundaries, and representative raw region chosen from the selected interval.
-- [ ] **Step 8: Implement `select_passage()` and verify GREEN.**
-- [ ] **Step 9: Commit:** `feat: select semantic video passages`.
+- [ ] Write moving-average tests. Width 3 must demonstrate: interior = previous/current/next; first/last = only available neighboring values.
+- [ ] Write population-z-score tests with deterministic expected values and zero-variance fallback.
+- [ ] Write Kadane tests for normal selection, non-positive fallback, equal-sum shorter-range tie-break, and equal-length earlier-start tie-break. Use the documented example `[-0.8, -0.3, 1.2, 1.5, 0.9, -0.2, -1.0]`, selecting `1.2, 1.5, 0.9`.
+- [ ] Write passage tests for fewer than three timestamps, zero variance, sustained cluster vs isolated spike, exact sampled boundaries, and representative raw region selected from inside the chosen interval.
+- [ ] Commit `test: define semantic video passage selection`; verify intended RED.
+- [ ] Implement the algorithms. Docstrings must state: smoothing changes temporal interval selection, z-score is local/not confidence, and Kadane only detects a contiguous numerical signal—it knows nothing about images/events.
+- [ ] Commit `feat: select semantic video passages`; require temporal suite GREEN.
 
 ---
 
-## Task 7: Implement the end-to-end search orchestration
+## Task 7: End-to-end search orchestration
 
-**Files:**
-- Create: `src/winston/search/pipeline.py`
-- Modify: `src/winston/search/__init__.py`
-- Create/extend: `tests/src/winston/search/test_pipeline.py`
+**Files:** `src/winston/search/pipeline.py`, `src/winston/search/__init__.py`, `tests/src/winston/search/test_pipeline.py`.
 
 **Flow:**
 
 ```text
 validate query + result limit
       ↓
-create/open embedder + visual index once
+create embedder + visual index once
       ↓
 open existing index read-only
       ↓
@@ -354,27 +340,23 @@ for each video window sequentially:
       ↓
 combine photo + video results
       ↓
-raw_score DESC + deterministic tie-breaks
+raw_score DESC + deterministic ties
       ↓
 limit
 ```
 
-- [ ] **Step 1: Build precise fake embedder/index types and write failing orchestration tests** proving query embedded once, identity passed to `open_search`, effective coarse limit `max(candidate_limit, requested_limit)`, photo deduplication, video-seed deduplication, window refinement exactly once, and sequential iterator consumption.
-- [ ] **Step 2: Run pipeline tests and verify RED.**
-- [ ] **Step 3: Implement `SearchPipeline.run()` minimally and verify GREEN.** Keep Qdrant types out of this module.
-- [ ] **Step 4: Add failing ranking/result-mapping tests** for photo/video combination, raw-score ranking, deterministic source/time tie-breaks, final limit after grouping, and empty results.
-- [ ] **Step 5: Implement mapping/ranking and verify GREEN.**
-- [ ] **Step 6: Add failing lifecycle tests** for `run_search()` constructing one embedder + one Qdrant index, closing both on success/failure, and preserving a primary failure while attaching cleanup failures as exception notes.
-- [ ] **Step 7: Implement resource lifecycle following the Phase 1E cleanup pattern and verify GREEN.**
-- [ ] **Step 8: Commit:** `feat: orchestrate semantic visual search`.
+- [ ] Build precise fake embedder/index types and tests proving query embedded exactly once, identity passed to `open_search`, effective coarse limit `max(candidate_limit, requested_limit)`, photo deduplication, video-seed deduplication, window refinement once, and sequential iterator consumption.
+- [ ] Add tests for photo/video result mapping, raw-score ranking, deterministic source/time ties, result limit after grouping, empty results, and cleanup behavior.
+- [ ] Add lifecycle tests proving one embedder + one Qdrant index per command, closure on success/failure, and primary exception preservation with cleanup errors attached as notes.
+- [ ] Commit `test: define semantic search orchestration`; verify intended RED.
+- [ ] Implement `SearchPipeline.run()` and `run_search()` using only Winston-owned contracts outside the Qdrant adapter; follow the Phase 1E cleanup pattern.
+- [ ] Commit `feat: orchestrate semantic visual search`; require search pipeline suite GREEN.
 
 ---
 
 ## Task 8: Expose `winston search` in the CLI
 
-**Files:**
-- Modify: `src/winston/cli.py`
-- Modify: `tests/src/winston/test_cli.py`
+**Files:** `src/winston/cli.py`, `tests/src/winston/test_cli.py`.
 
 **CLI:**
 
@@ -382,7 +364,7 @@ limit
 winston search QUERY [--limit N]
 ```
 
-Example result:
+Example:
 
 ```text
 1. camera/parking.mkv
@@ -392,58 +374,53 @@ Example result:
    raw score: 0.421893
 ```
 
-- [ ] **Step 1: Write failing parser/dispatch tests** for query, configured default limit, explicit positive `--limit`, and invalid non-positive limit.
-- [ ] **Step 2: Verify RED, implement parser/dispatch, verify GREEN.**
-- [ ] **Step 3: Write failing behavior tests** proving whitespace-only queries fail before expensive search construction, errors go to stderr with exit code 1, empty valid search exits 0, image output omits passage lines, video output includes passage/representative timestamps, region geometry is printed, raw score is printed with no `%` or confidence label.
-- [ ] **Step 4: Implement formatting/command wrapper and verify GREEN.** Reuse `_format_duration()`.
-- [ ] **Step 5: Commit:** `feat: expose semantic search CLI`.
+- [ ] Write parser/dispatch tests for query, configured default limit, explicit positive `--limit`, and invalid non-positive limit.
+- [ ] Write behavior tests proving whitespace-only query rejection before expensive search construction, stderr + exit 1 on failure, empty valid search exit 0, image output without passage, video output with passage/representative timestamp, region geometry, raw score, and no `%`/confidence label.
+- [ ] Commit `test: define semantic search CLI behavior`; verify intended RED.
+- [ ] Implement parser, dispatch, command wrapper, and formatting; reuse `_format_duration()`.
+- [ ] Commit `feat: expose semantic search CLI`; require CLI + search suite GREEN.
 
 ---
 
-## Task 9: Add real Qdrant semantic-search integration and permanent CI coverage
+## Task 9: Real Qdrant integration and permanent CI coverage
 
-**Files:**
-- Create: `tests/integration/test_semantic_search_qdrant.py`
-- Modify: `.github/workflows/qdrant-index.yml`
+**Files:** `tests/integration/test_semantic_search_qdrant.py`, `.github/workflows/qdrant-index.yml`.
 
-- [ ] **Step 1: Write real-Qdrant integration tests** against `qdrant/qdrant:v1.18.2` for read-only opening of schema-v2 state, known-vector coarse ordering, bounded filtered timeline retrieval, image/video payload reconstruction, and local cosine agreement with Qdrant scores within floating-point tolerance.
-- [ ] **Step 2: Extend the permanent Qdrant workflow** to run Phase 1F config/CLI/search/index adapter tests plus the new integration test while retaining relevant Phase 1E regressions and compileall.
-- [ ] **Step 3: Push the RED integration/CI commit only if needed to observe the intended failure in GitHub Actions; otherwise preserve the normal local-contract RED/GREEN sequence through branch commits.** All execution remains on GitHub Actions, not Mac Studio.
-- [ ] **Step 4: Implement/fix only issues exposed by the real server, then require the retained workflow to be GREEN.**
-- [ ] **Step 5: Commit:** `test: cover semantic search with Qdrant`.
+- [ ] Write real-Qdrant integration tests against `qdrant/qdrant:v1.18.2` for schema-v2 read-only opening, known-vector coarse ordering, bounded filtered timeline retrieval, image/video payload reconstruction, and local-cosine agreement with Qdrant scores within tolerance.
+- [ ] Extend the permanent Qdrant workflow to run Phase 1F config/CLI/search/index-adapter tests plus the new integration test while retaining relevant Phase 1E regressions and compileall.
+- [ ] Commit `test: cover semantic search with Qdrant`; verify the new integration contract in GitHub Actions. If implementation gaps make it RED, the failure must be the expected behavioral gap.
+- [ ] Fix only concrete integration issues with focused regression tests first, then commit `fix:` changes and require the retained workflow GREEN.
 
 ---
 
-## Task 10: Run real Jina end-to-end validation, full regression, and open the draft PR
+## Task 10: Real Jina end-to-end validation, full regression, and draft PR
 
-**Temporary validation:** create a dedicated branch from the final feature head, for example:
+Create a dedicated temporary branch from the final feature head:
 
 ```text
 test/semantic-search-validation
 ```
 
-Add a temporary workflow only on that branch with two jobs:
+Add a temporary workflow **only on that branch** with two jobs:
 
 ```text
 full-regression
 real-jina-search
 ```
 
-The real Jina job uses the existing `JINA_API_KEY` secret and Qdrant 1.18.2. It generates tiny red/blue image fixtures, indexes them with the Jina API engine, then searches for a red-square query and verifies the red image ranks above the blue image. It must also verify output contains a raw score and no fabricated percentage.
+The real Jina job uses the existing `JINA_API_KEY` secret and Qdrant 1.18.2. It creates tiny red/blue image fixtures, indexes them with the Jina API engine, searches for a red-square query, and verifies the red image ranks above the blue image. It also verifies output contains a raw score and no fabricated percentage.
 
-- [ ] **Step 1: Create the dedicated temporary validation branch/workflow using GitHub only.**
-- [ ] **Step 2: `full-regression` runs at least `uv lock --check`, locked dependency sync, complete Winston pytest regression, and `python -m compileall -q src tests`.**
-- [ ] **Step 3: `real-jina-search` performs an actual Jina text/image -> Qdrant -> Winston search path using `JINA_API_KEY`.**
-- [ ] **Step 4: Inspect logs/results; fix implementation on `feat/semantic-search-cli` with TDD if either validation exposes a real bug, then rerun validation from the updated head.**
-- [ ] **Step 5: Once both jobs are GREEN, delete the temporary workflow/branch. Confirm it is absent from the feature branch.**
-- [ ] **Step 6: Review `main...feat/semantic-search-cli` for scope creep, `Any`/`object` additions, missing docstrings/comments, accidental Qdrant imports outside the adapter, and temporary CI files.**
-- [ ] **Step 7: Confirm the retained permanent GitHub Actions are GREEN on the final feature head.**
-- [ ] **Step 8: Open a draft PR titled `feat: add semantic search CLI` with a concise summary, exact validation evidence, and `Closes #10`.**
-- [ ] **Step 9: Leave the PR draft/unmerged for user review.**
+- [ ] Create the temporary validation branch/workflow using GitHub only.
+- [ ] `full-regression`: run `uv lock --check`, locked dependency sync, complete Winston pytest regression, and `python -m compileall -q src tests`.
+- [ ] `real-jina-search`: execute actual Jina text/image -> Qdrant -> Winston search using `JINA_API_KEY`.
+- [ ] Inspect Actions results. If either job exposes a real bug, add a focused RED regression test on `feat/semantic-search-cli`, prove RED in Actions, implement the fix, prove GREEN, then rerun the validation branch from the updated feature head.
+- [ ] Once both jobs are GREEN, delete the temporary validation branch/workflow.
+- [ ] Compare `main...feat/semantic-search-cli` and check scope, `Any`/`object`, docstrings/comments, accidental Qdrant imports outside the adapter, and temporary CI files.
+- [ ] Confirm retained permanent Actions GREEN on final feature head.
+- [ ] Open a draft PR titled `feat: add semantic search CLI` with concise summary, exact validation evidence, and `Closes #10`.
+- [ ] Leave the PR draft/unmerged for user review.
 
 ## Final Definition of Done
-
-Phase 1F is ready for user review only when all of the following are true:
 
 ```text
 winston search QUERY works for photos and videos
@@ -452,7 +429,7 @@ existing Qdrant collection is opened read-only
 coarse ANN retrieval uses raw cosine similarity
 photo regions collapse to one user result per asset
 video seeds create bounded/merged neighborhoods
-all stored keyframe regions in a neighborhood are rescored
+all stored keyframe regions in each neighborhood are rescored
 one best region becomes the score for each keyframe
 moving average -> z-score -> Kadane selects a sparse-keyframe passage
 raw representative cosine score drives final ranking
@@ -460,7 +437,7 @@ no percentage confidence is shown
 Qdrant SDK types stay behind the index adapter
 no schema bump/reindex is introduced
 memory/network reads are bounded by pagination + sequential windows
-important temporal math is documented with concrete examples
+important temporal math is documented with concrete numeric examples
 all Phase 1F + relevant regression tests pass
 real Qdrant 1.18.2 integration passes
 real Jina end-to-end validation passes
