@@ -57,7 +57,7 @@ class QdrantSettings(BaseSettings):
 class IndexingSettings(BaseSettings):
     """Settings that bound Winston's high-level indexing orchestration."""
 
-    visual_batch_size: PositiveInt = 9
+    visual_batch_size: PositiveInt = 20
 
 
 # The engine field is the discriminator, so provider-specific settings cannot be mixed together.
