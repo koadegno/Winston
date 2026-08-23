@@ -13,26 +13,56 @@ permissions:
 jobs:
   inspect-release:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
         with:
           ref: test/semantic-search-media-inspection
-      - name: Inspect releases and assets
+      - name: Download release videos and build contact sheets
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p tmp/semantic-search-media
+          output=tmp/semantic-search-media
+          work="$RUNNER_TEMP/winston-media"
+          rm -rf "$work"
+          mkdir -p "$work" "$output/contact-sheets"
+          rm -f "$output/contact-sheets"/*.jpg "$output/videos-info.txt"
+
+          gh release download test-dataset-v1 \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern videos.zip \
+            --dir "$work"
+          unzip -q "$work/videos.zip" -d "$work/videos"
+
           {
-            echo '# Releases'
-            gh release list --repo "$GITHUB_REPOSITORY" --limit 20
+            echo '# Video files from release test-dataset-v1'
             echo
-            echo '# Latest release JSON'
-            gh release view --repo "$GITHUB_REPOSITORY" --json tagName,name,publishedAt,url,assets
-          } > tmp/semantic-search-media/release-info.txt
+            find "$work/videos" -type f -printf '%P\n' | sort
+            echo
+            echo '# ffprobe metadata'
+          } > "$output/videos-info.txt"
+
+          while IFS= read -r -d '' video; do
+            rel="${video#"$work/videos/"}"
+            safe=$(printf '%s' "$rel" | tr '/ .' '___' | tr -cd '[:alnum:]_-')
+            duration=$(ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 "$video")
+            {
+              echo
+              echo "## $rel"
+              ffprobe -v error \
+                -show_entries format=duration,size:stream=index,codec_type,codec_name,width,height,avg_frame_rate \
+                -of default=noprint_wrappers=1 "$video"
+            } >> "$output/videos-info.txt"
+
+            ffmpeg -hide_banner -loglevel error -i "$video" \
+              -vf "fps=12/${duration},scale=320:-2,tile=4x3" \
+              -frames:v 1 "$output/contact-sheets/${safe}.jpg"
+          done < <(find "$work/videos" -type f \( -iname '*.mkv' -o -iname '*.mp4' -o -iname '*.mov' -o -iname '*.avi' \) -print0 | sort -z)
+
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          git add tmp/semantic-search-media/release-info.txt
-          git commit -m 'test: inspect semantic search media release'
+          git add "$output/videos-info.txt" "$output/contact-sheets"
+          git commit -m 'test: inspect semantic search release videos'
           git push origin HEAD:test/semantic-search-media-inspection
