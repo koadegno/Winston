@@ -27,7 +27,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          output=tmp/semantic-search-media
+          repo="$PWD"
+          output="$repo/tmp/semantic-search-media"
           work=/tmp/winston-semantic-media
           rm -rf "$work"
           mkdir -p "$work" "$output/contact-sheets"
@@ -39,17 +40,18 @@ jobs:
             --dir "$work"
           unzip -q "$work/videos.zip" -d "$work/videos"
 
+          cd "$work/videos"
           {
             echo '# Video files from release test-dataset-v1'
             echo
-            find "$work/videos" -type f -printf '%P\n' | sort
+            find . -type f -printf '%P\n' | sort
             echo
             echo '# ffprobe metadata'
           } > "$output/videos-info.txt"
 
           while IFS= read -r -d '' discovered; do
-            video=$(realpath "$discovered")
-            rel=$(realpath --relative-to="$work/videos" "$video")
+            rel="${discovered#./}"
+            video="$PWD/$rel"
             safe=$(printf '%s' "$rel" | tr '/ .' '___' | tr -cd '[:alnum:]_-')
             duration=$(ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 "$video")
             {
@@ -62,12 +64,13 @@ jobs:
 
             ffmpeg -hide_banner -loglevel error -i "$video" \
               -vf "fps=12/${duration},scale=320:-2,drawtext=text='%{pts\\:hms}':x=8:y=8:fontsize=18:fontcolor=white:box=1:boxcolor=black@0.55,tile=4x3" \
-              -frames:v 1 "$output/contact-sheets/${safe}.jpg"
-          done < <(find "$work/videos" -type f \( -iname '*.mkv' -o -iname '*.mp4' -o -iname '*.mov' -o -iname '*.avi' \) -print0 | sort -z)
+              -frames:v 1 -y "$output/contact-sheets/${safe}.jpg"
+          done < <(find . -type f \( -iname '*.mkv' -o -iname '*.mp4' -o -iname '*.mov' -o -iname '*.avi' \) -print0 | sort -z)
 
+          cd "$repo"
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          git add "$output/videos-info.txt" "$output/contact-sheets"
+          git add tmp/semantic-search-media/videos-info.txt tmp/semantic-search-media/contact-sheets
           if git diff --cached --quiet; then
             echo 'No inspection outputs changed.'
             exit 0
