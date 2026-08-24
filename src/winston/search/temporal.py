@@ -34,6 +34,41 @@ class TemporalObservation:
             raise ValueError("timestamp_us must match the representative visual timestamp")
 
 
+class TemporalObservationAccumulator:
+    """Retain only the strongest scored region for each sampled video timestamp.
+
+    Timeline retrieval can stream several full/tile vectors for every keyframe. Keeping
+    all of them until the window ends defeats Qdrant pagination because every dense
+    vector stays live in Winston. This accumulator applies the same deterministic
+    per-timestamp collapse online, so losing region vectors can be released as soon as
+    the next stronger region is known.
+    """
+
+    def __init__(self) -> None:
+        self._best: dict[tuple[str, int], ScoredVisual] = {}
+
+    def add(self, match: ScoredVisual) -> None:
+        """Consume one scored video region and retain it only if it wins its timestamp."""
+        visual = match.visual
+        timestamp_us = visual.timestamp_us
+        if visual.media_type is not MediaType.VIDEO or timestamp_us is None:
+            raise ValueError("timestamp collapse accepts only timestamped video matches")
+        key = (visual.asset_id, timestamp_us)
+        current = self._best.get(key)
+        if current is None or _match_order_key(match) < _match_order_key(current):
+            self._best[key] = match
+
+    def observations(self) -> tuple[TemporalObservation, ...]:
+        """Return retained winners in stable asset/timestamp order."""
+        return tuple(
+            TemporalObservation(
+                timestamp_us=timestamp_us,
+                match=self._best[(asset_id, timestamp_us)],
+            )
+            for asset_id, timestamp_us in sorted(self._best)
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class TemporalWindow:
     """One merged video interval whose complete indexed neighborhood must be retrieved."""
@@ -116,21 +151,10 @@ def collapse_best_by_timestamp(
     region that produced that score. This prevents a tiled keyframe from getting more
     temporal votes merely because it generated more indexed regions.
     """
-    best: dict[tuple[str, int], ScoredVisual] = {}
+    accumulator = TemporalObservationAccumulator()
     for match in matches:
-        visual = match.visual
-        timestamp_us = visual.timestamp_us
-        if visual.media_type is not MediaType.VIDEO or timestamp_us is None:
-            raise ValueError("timestamp collapse accepts only timestamped video matches")
-        key = (visual.asset_id, timestamp_us)
-        current = best.get(key)
-        if current is None or _match_order_key(match) < _match_order_key(current):
-            best[key] = match
-
-    return tuple(
-        TemporalObservation(timestamp_us=timestamp_us, match=best[(asset_id, timestamp_us)])
-        for asset_id, timestamp_us in sorted(best)
-    )
+        accumulator.add(match)
+    return accumulator.observations()
 
 
 def build_temporal_windows(
