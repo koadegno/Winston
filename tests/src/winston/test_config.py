@@ -182,6 +182,12 @@ def test_search_settings_reject_non_positive_values(field: str, value: int | flo
         Settings(search={field: value})
 
 
+def test_search_settings_reject_candidate_max_below_candidate_limit() -> None:
+    """The overfetch maximum must be a true upper bound above the initial candidate budget."""
+    with pytest.raises(ValidationError):
+        Settings(search={"candidate_limit": 20, "candidate_max_limit": 19})
+
+
 @pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
 def test_search_settings_reject_non_finite_temporal_context(value: float) -> None:
     """Temporal context cannot accept NaN or infinite values."""
