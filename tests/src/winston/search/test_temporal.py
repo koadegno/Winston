@@ -177,6 +177,31 @@ def test_build_temporal_windows_merges_reference_example() -> None:
     ]
 
 
+def test_build_temporal_windows_bounds_long_transitive_chain_without_losing_coverage() -> None:
+    """Overlapping seed contexts may chain for minutes, but no refinement window may exceed 60s."""
+    seeds = collapse_best_by_timestamp(
+        [_video_match(float(timestamp), 0.8) for timestamp in range(30, 301, 10)]
+    )
+
+    windows = build_temporal_windows(
+        seeds,
+        context_seconds=15.0,
+        max_window_seconds=60.0,
+    )
+
+    assert len(windows) > 1
+    assert windows[0].start_timestamp_us == 15_000_000
+    assert windows[-1].end_timestamp_us == 315_000_000
+    assert all(
+        window.end_timestamp_us - window.start_timestamp_us <= 60_000_000
+        for window in windows
+    )
+    assert all(
+        following.start_timestamp_us == previous.end_timestamp_us + 1
+        for previous, following in zip(windows, windows[1:], strict=True)
+    )
+
+
 def test_build_temporal_windows_merges_touching_windows_and_clips_zero() -> None:
     """Touching [5,15] and [15,25] intervals merge, while an early seed cannot start below zero."""
     touching = collapse_best_by_timestamp(
