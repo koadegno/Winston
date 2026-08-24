@@ -144,13 +144,13 @@ class SearchPipeline:
         fewer distinct photo assets/video neighborhoods than the requested result count.
         The configured hard limit bounds the extra ANN work and memory.
         """
-        current_limit = max(
-            int(self._settings.search.candidate_limit),
-            requested_limit,
-        )
-        hard_limit = max(
-            current_limit,
-            int(self._settings.search.candidate_max_limit),
+        hard_limit = int(self._settings.search.candidate_max_limit)
+        current_limit = min(
+            max(
+                int(self._settings.search.candidate_limit),
+                requested_limit,
+            ),
+            hard_limit,
         )
         context_seconds = float(self._settings.search.temporal_context_seconds)
 
