@@ -16,6 +16,7 @@ from winston.ingest.models import MediaType
 from winston.search.models import SearchResult, SearchRunError
 from winston.search.temporal import (
     MICROSECONDS_PER_SECOND,
+    TemporalObservationAccumulator,
     build_temporal_windows,
     collapse_best_by_timestamp,
     cosine_similarity,
@@ -75,7 +76,7 @@ class SearchPipeline:
                 context_seconds=float(self._settings.search.temporal_context_seconds),
             )
             for window in windows:
-                local_matches: list[ScoredVisual] = []
+                local_observations = TemporalObservationAccumulator()
                 async for visual in self._visual_index.iter_visuals(
                     asset_id=window.asset_id,
                     start_timestamp_us=window.start_timestamp_us,
@@ -86,16 +87,16 @@ class SearchPipeline:
                     # copy of the same bytes influence this passage's provenance.
                     if visual.source_path != window.source_path:
                         continue
-                    local_matches.append(
+                    local_observations.add(
                         ScoredVisual(
                             visual=visual,
                             score=cosine_similarity(query_vector, visual.vector),
                         )
                     )
 
-                if not local_matches:
+                observations = local_observations.observations()
+                if not observations:
                     continue
-                observations = collapse_best_by_timestamp(local_matches)
                 passage = select_passage(
                     observations,
                     moving_average_frames=int(
