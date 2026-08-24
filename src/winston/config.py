@@ -63,16 +63,61 @@ class IndexingSettings(BaseSettings):
 class SearchSettings(BaseSettings):
     """Settings that bound semantic retrieval and local temporal refinement."""
 
-    # Retrieval starts at candidate_limit and may overfetch up to candidate_max_limit
-    # when raw ANN points collapse into too few user-facing photo/video neighborhoods.
-    result_limit: PositiveInt = 10
-    candidate_limit: PositiveInt = 200
-    candidate_max_limit: PositiveInt = 2_000
-    timeline_page_size: PositiveInt = 256
-
-    # These two values can change the semantic extent selected for a video passage.
-    temporal_context_seconds: Annotated[FiniteFloat, Field(gt=0)] = 15.0
-    moving_average_frames: PositiveInt = 3
+    result_limit: PositiveInt = Field(
+        default=10,
+        description=(
+            "Default number of user-facing results returned when no explicit limit is supplied; "
+            "this is output policy and does not change semantic scoring."
+        ),
+    )
+    candidate_limit: PositiveInt = Field(
+        default=200,
+        description=(
+            "Initial number of raw ANN visual points requested from Qdrant; this is a runtime/recall "
+            "tradeoff before grouping into user-facing results."
+        ),
+    )
+    candidate_max_limit: PositiveInt = Field(
+        default=2_000,
+        description=(
+            "Hard maximum number of raw ANN visual points considered after iterative overfetch; "
+            "this is an explicit runtime/resource bound and can cap recall when exhausted."
+        ),
+    )
+    timeline_page_size: PositiveInt = Field(
+        default=256,
+        description=(
+            "Number of indexed visual points requested per Qdrant timeline scroll page; this is a "
+            "runtime/resource transport bound and does not change covered semantic time ranges."
+        ),
+    )
+    temporal_context_seconds: Annotated[
+        FiniteFloat,
+        Field(
+            gt=0,
+            description=(
+                "Seconds of context added before and after each video ANN seed before grouping; "
+                "this is a semantic parameter that can change candidate passage extent."
+            ),
+        ),
+    ] = 15.0
+    temporal_max_window_seconds: Annotated[
+        FiniteFloat,
+        Field(
+            gt=0,
+            description=(
+                "Hard maximum duration in seconds of each merged video candidate window; this is "
+                "an explicit runtime/resource bound that can split long semantic neighborhoods."
+            ),
+        ),
+    ] = 60.0
+    moving_average_frames: PositiveInt = Field(
+        default=3,
+        description=(
+            "Odd number of sampled frames used by centered moving-average smoothing; this is a "
+            "semantic passage-shaping parameter."
+        ),
+    )
 
     @field_validator("moving_average_frames")
     @classmethod
@@ -83,10 +128,14 @@ class SearchSettings(BaseSettings):
         return value
 
     @model_validator(mode="after")
-    def validate_candidate_bounds(self) -> Self:
-        """Keep the iterative ANN budget ordered so the maximum is a real hard bound."""
+    def validate_search_bounds(self) -> Self:
+        """Keep ANN and temporal safety limits internally consistent."""
         if self.candidate_max_limit < self.candidate_limit:
             raise ValueError("candidate_max_limit must be >= candidate_limit")
+        if self.temporal_max_window_seconds < 2 * self.temporal_context_seconds:
+            raise ValueError(
+                "temporal_max_window_seconds must be >= 2 * temporal_context_seconds"
+            )
         return self
 
 
