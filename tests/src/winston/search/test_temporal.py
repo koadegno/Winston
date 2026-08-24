@@ -166,7 +166,11 @@ def test_build_temporal_windows_merges_reference_example() -> None:
         ]
     )
 
-    windows = build_temporal_windows(seeds, context_seconds=15.0)
+    windows = build_temporal_windows(
+        seeds,
+        context_seconds=15.0,
+        max_window_seconds=60.0,
+    )
 
     assert [
         (window.asset_id, window.source_path, window.start_timestamp_us, window.end_timestamp_us)
@@ -198,7 +202,7 @@ def test_build_temporal_windows_bounds_long_transitive_chain_without_losing_cove
     )
     assert all(
         following.start_timestamp_us == previous.end_timestamp_us + 1
-        for previous, following in zip(windows, windows[1:], strict=True)
+        for previous, following in zip(windows, windows[1:])
     )
 
 
@@ -209,8 +213,16 @@ def test_build_temporal_windows_merges_touching_windows_and_clips_zero() -> None
     )
     early = collapse_best_by_timestamp([_video_match(3.0, 0.7)])
 
-    touching_windows = build_temporal_windows(touching, context_seconds=5.0)
-    early_windows = build_temporal_windows(early, context_seconds=5.0)
+    touching_windows = build_temporal_windows(
+        touching,
+        context_seconds=5.0,
+        max_window_seconds=60.0,
+    )
+    early_windows = build_temporal_windows(
+        early,
+        context_seconds=5.0,
+        max_window_seconds=60.0,
+    )
 
     assert len(touching_windows) == 1
     assert touching_windows[0].start_timestamp_us == 5_000_000
@@ -234,7 +246,11 @@ def test_build_temporal_windows_never_merges_different_assets() -> None:
         ]
     )
 
-    windows = build_temporal_windows(seeds, context_seconds=5.0)
+    windows = build_temporal_windows(
+        seeds,
+        context_seconds=5.0,
+        max_window_seconds=60.0,
+    )
 
     assert [(window.asset_id, window.source_path) for window in windows] == [
         (ASSET_A, "cameras/a.mkv"),
@@ -248,7 +264,36 @@ def test_build_temporal_windows_rejects_invalid_context(context_seconds: float) 
     seeds = collapse_best_by_timestamp([_video_match(10.0, 0.5)])
 
     with pytest.raises(ValueError, match="context_seconds"):
-        build_temporal_windows(seeds, context_seconds=context_seconds)
+        build_temporal_windows(
+            seeds,
+            context_seconds=context_seconds,
+            max_window_seconds=60.0,
+        )
+
+
+@pytest.mark.parametrize("max_window_seconds", [0.0, -1.0, math.nan, math.inf])
+def test_build_temporal_windows_rejects_invalid_max_window(max_window_seconds: float) -> None:
+    """The refinement hard bound must be a finite positive duration."""
+    seeds = collapse_best_by_timestamp([_video_match(10.0, 0.5)])
+
+    with pytest.raises(ValueError, match="max_window_seconds"):
+        build_temporal_windows(
+            seeds,
+            context_seconds=5.0,
+            max_window_seconds=max_window_seconds,
+        )
+
+
+def test_build_temporal_windows_rejects_max_smaller_than_one_seed_context_width() -> None:
+    """A single +/-context neighborhood must fit inside one bounded refinement window."""
+    seeds = collapse_best_by_timestamp([_video_match(100.0, 0.5)])
+
+    with pytest.raises(ValueError, match="max_window_seconds"):
+        build_temporal_windows(
+            seeds,
+            context_seconds=15.0,
+            max_window_seconds=29.0,
+        )
 
 
 def test_centered_moving_average_width_three_uses_available_edge_neighbors() -> None:
