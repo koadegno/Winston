@@ -140,19 +140,19 @@ class MemoryProbeVisualIndex(PagedFakeVisualIndex):
 def _settings(
     *,
     candidate_limit: int,
-    candidate_max_limit: int,
+    candidate_max_limit: int | None = None,
     context_seconds: float = 5.0,
 ) -> Settings:
-    return Settings(
-        search={
-            "result_limit": 10,
-            "candidate_limit": candidate_limit,
-            "candidate_max_limit": candidate_max_limit,
-            "temporal_context_seconds": context_seconds,
-            "moving_average_frames": 3,
-            "timeline_page_size": 2,
-        }
-    )
+    search_config: dict[str, int | float] = {
+        "result_limit": 10,
+        "candidate_limit": candidate_limit,
+        "temporal_context_seconds": context_seconds,
+        "moving_average_frames": 3,
+        "timeline_page_size": 2,
+    }
+    if candidate_max_limit is not None:
+        search_config["candidate_max_limit"] = candidate_max_limit
+    return Settings(search=search_config)
 
 
 def _geometry(region_kind: RegionKind, tile_index: int = 0) -> RegionGeometry:
@@ -276,7 +276,7 @@ async def test_pipeline_discards_non_winning_region_vectors_while_streaming_time
     coarse = (_video_seed("a", "videos/event.mkv", 10.0, 0.9),)
     index = MemoryProbeVisualIndex(coarse=coarse)
     pipeline = SearchPipeline(
-        settings=_settings(candidate_limit=1, candidate_max_limit=1),
+        settings=_settings(candidate_limit=1),
         embedder=FakeEmbedder(),
         visual_index=index,
     )
