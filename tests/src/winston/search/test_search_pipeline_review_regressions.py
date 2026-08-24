@@ -271,6 +271,24 @@ async def test_pipeline_stops_candidate_overfetch_at_configured_hard_limit() -> 
 
 
 @pytest.mark.asyncio
+async def test_pipeline_never_exceeds_candidate_hard_limit_for_large_result_request() -> None:
+    """A large --limit value must not override the configured raw ANN safety bound."""
+    coarse = tuple(
+        _video_seed("a", "videos/event.mkv", 10.0 + offset, 0.95 - offset / 100.0)
+        for offset in range(10)
+    )
+    index = PagedFakeVisualIndex(coarse=coarse, timeline={})
+    pipeline = SearchPipeline(
+        settings=_settings(candidate_limit=2, candidate_max_limit=4, context_seconds=30.0),
+        embedder=FakeEmbedder(),
+        visual_index=index,
+    )
+
+    assert await pipeline.run("person", limit=10) == ()
+    assert index.search_limits == [4]
+
+
+@pytest.mark.asyncio
 async def test_pipeline_discards_non_winning_region_vectors_while_streaming_timeline() -> None:
     """Local refinement must retain at most the strongest scored region for each timestamp."""
     coarse = (_video_seed("a", "videos/event.mkv", 10.0, 0.9),)
