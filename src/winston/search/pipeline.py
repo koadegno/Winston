@@ -74,6 +74,9 @@ class SearchPipeline:
             windows = build_temporal_windows(
                 seed_observations,
                 context_seconds=float(self._settings.search.temporal_context_seconds),
+                max_window_seconds=float(
+                    self._settings.search.temporal_max_window_seconds
+                ),
             )
             for window in windows:
                 local_observations = TemporalObservationAccumulator()
@@ -153,6 +156,9 @@ class SearchPipeline:
             hard_limit,
         )
         context_seconds = float(self._settings.search.temporal_context_seconds)
+        max_window_seconds = float(
+            self._settings.search.temporal_max_window_seconds
+        )
 
         while True:
             matches = tuple(
@@ -164,6 +170,7 @@ class SearchPipeline:
             opportunity_count = _coarse_result_opportunity_count(
                 matches,
                 context_seconds=context_seconds,
+                max_window_seconds=max_window_seconds,
             )
             if opportunity_count >= requested_limit:
                 return matches
@@ -180,8 +187,9 @@ def _coarse_result_opportunity_count(
     matches: Sequence[ScoredVisual],
     *,
     context_seconds: float,
+    max_window_seconds: float,
 ) -> int:
-    """Count grouped photo assets plus merged video neighborhoods in raw ANN matches."""
+    """Count grouped photo assets plus bounded video neighborhoods in raw ANN matches."""
     photo_asset_ids = {
         match.visual.asset_id
         for match in matches
@@ -199,6 +207,7 @@ def _coarse_result_opportunity_count(
     video_windows = build_temporal_windows(
         video_observations,
         context_seconds=context_seconds,
+        max_window_seconds=max_window_seconds,
     )
     return len(photo_asset_ids) + len(video_windows)
 
