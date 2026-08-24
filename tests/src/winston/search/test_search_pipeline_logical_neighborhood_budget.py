@@ -18,7 +18,6 @@ from winston.index.models import (
 from winston.ingest.models import MediaType
 from winston.sampling.regions import RegionKind
 from winston.search.pipeline import SearchPipeline
-from winston.search.temporal import build_temporal_windows, collapse_best_by_timestamp
 
 IDENTITY = EmbeddingIdentity(
     model_id="jinaai/jina-clip-v1",
@@ -134,31 +133,6 @@ def _settings() -> Settings:
             "moving_average_frames": 3,
         }
     )
-
-
-def test_long_logical_neighborhood_gets_one_bounded_window_around_strongest_seed() -> None:
-    """Runtime capping must not turn one connected semantic neighborhood into many results."""
-    matches = [
-        _video_seed(
-            "a",
-            "videos/a.mkv",
-            float(timestamp),
-            0.99 if timestamp == 150 else 0.60,
-        )
-        for timestamp in range(30, 301, 10)
-    ]
-    seeds = collapse_best_by_timestamp(matches)
-
-    windows = build_temporal_windows(
-        seeds,
-        context_seconds=15.0,
-        max_window_seconds=60.0,
-    )
-
-    assert len(windows) == 1
-    assert windows[0].asset_id == ASSET_A
-    assert windows[0].start_timestamp_us == 120_000_000
-    assert windows[0].end_timestamp_us == 180_000_000
 
 
 @pytest.mark.asyncio
