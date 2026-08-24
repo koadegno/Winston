@@ -10,6 +10,7 @@ from winston.config import (
     JinaLocalEmbeddingSettings,
     LocalBackend,
     QdrantSettings,
+    SearchSettings,
     Settings,
     get_config,
 )
@@ -139,9 +140,10 @@ def test_search_settings_have_v0_defaults() -> None:
         "result_limit": 10,
         "candidate_limit": 200,
         "candidate_max_limit": 2_000,
-        "temporal_context_seconds": 15.0,
-        "moving_average_frames": 3,
         "timeline_page_size": 256,
+        "temporal_context_seconds": 15.0,
+        "temporal_max_window_seconds": 60.0,
+        "moving_average_frames": 3,
     }
 
 
@@ -152,18 +154,46 @@ def test_search_settings_read_nested_environment_overrides(
     monkeypatch.setenv("SEARCH__RESULT_LIMIT", "7")
     monkeypatch.setenv("SEARCH__CANDIDATE_LIMIT", "80")
     monkeypatch.setenv("SEARCH__CANDIDATE_MAX_LIMIT", "640")
-    monkeypatch.setenv("SEARCH__TEMPORAL_CONTEXT_SECONDS", "9.5")
-    monkeypatch.setenv("SEARCH__MOVING_AVERAGE_FRAMES", "5")
     monkeypatch.setenv("SEARCH__TIMELINE_PAGE_SIZE", "64")
+    monkeypatch.setenv("SEARCH__TEMPORAL_CONTEXT_SECONDS", "9.5")
+    monkeypatch.setenv("SEARCH__TEMPORAL_MAX_WINDOW_SECONDS", "45.0")
+    monkeypatch.setenv("SEARCH__MOVING_AVERAGE_FRAMES", "5")
 
     assert Settings().model_dump().get("search") == {
         "result_limit": 7,
         "candidate_limit": 80,
         "candidate_max_limit": 640,
-        "temporal_context_seconds": 9.5,
-        "moving_average_frames": 5,
         "timeline_page_size": 64,
+        "temporal_context_seconds": 9.5,
+        "temporal_max_window_seconds": 45.0,
+        "moving_average_frames": 5,
     }
+
+
+def test_search_settings_describe_units_and_behavior() -> None:
+    """Every search knob must explain its unit and whether it shapes semantics or runtime/output."""
+    expected_units = {
+        "result_limit": "results",
+        "candidate_limit": "visual points",
+        "candidate_max_limit": "visual points",
+        "timeline_page_size": "visual points",
+        "temporal_context_seconds": "seconds",
+        "temporal_max_window_seconds": "seconds",
+        "moving_average_frames": "sampled frames",
+    }
+
+    for field_name, unit in expected_units.items():
+        description = SearchSettings.model_fields[field_name].description
+        assert description is not None
+        normalized = description.lower()
+        assert unit in normalized
+        assert any(
+            category in normalized
+            for category in ("semantic", "runtime", "resource", "output")
+        )
+
+    assert "hard" in SearchSettings.model_fields["candidate_max_limit"].description.lower()  # type: ignore[union-attr]
+    assert "hard" in SearchSettings.model_fields["temporal_max_window_seconds"].description.lower()  # type: ignore[union-attr]
 
 
 @pytest.mark.parametrize(
@@ -172,12 +202,13 @@ def test_search_settings_read_nested_environment_overrides(
         ("result_limit", 0),
         ("candidate_limit", 0),
         ("candidate_max_limit", 0),
-        ("temporal_context_seconds", 0.0),
         ("timeline_page_size", 0),
+        ("temporal_context_seconds", 0.0),
+        ("temporal_max_window_seconds", 0.0),
     ],
 )
 def test_search_settings_reject_non_positive_values(field: str, value: int | float) -> None:
-    """Search limits and temporal context must remain strictly positive."""
+    """Search limits and temporal bounds must remain strictly positive."""
     with pytest.raises(ValidationError):
         Settings(search={field: value})
 
@@ -188,11 +219,23 @@ def test_search_settings_reject_candidate_max_below_candidate_limit() -> None:
         Settings(search={"candidate_limit": 20, "candidate_max_limit": 19})
 
 
-@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
-def test_search_settings_reject_non_finite_temporal_context(value: float) -> None:
-    """Temporal context cannot accept NaN or infinite values."""
+def test_search_settings_reject_temporal_max_below_single_seed_context_width() -> None:
+    """One +/-context seed neighborhood must fit inside the configured hard window bound."""
     with pytest.raises(ValidationError):
-        Settings(search={"temporal_context_seconds": value})
+        Settings(
+            search={
+                "temporal_context_seconds": 15.0,
+                "temporal_max_window_seconds": 29.0,
+            }
+        )
+
+
+@pytest.mark.parametrize("field", ["temporal_context_seconds", "temporal_max_window_seconds"])
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_search_settings_reject_non_finite_temporal_values(field: str, value: float) -> None:
+    """Temporal context and hard window duration cannot accept NaN or infinite values."""
+    with pytest.raises(ValidationError):
+        Settings(search={field: value})
 
 
 def test_search_settings_reject_even_moving_average_width() -> None:
