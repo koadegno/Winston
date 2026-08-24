@@ -266,6 +266,8 @@ async def test_visual_batch_size_never_exceeds_nine(
     """Region generation must stream into batches bounded by visual_batch_size=9."""
     _write_media(tmp_path, "large.jpg")
     _install_image_stubs(monkeypatch, width=100, height=100)
+    # This test exercises an explicit orchestration bound; the application default may evolve independently.
+    monkeypatch.setenv("INDEXING__VISUAL_BATCH_SIZE", "9")
     pipeline, embedder, _ = _pipeline(tmp_path)
 
     result = await pipeline.run()

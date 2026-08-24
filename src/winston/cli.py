@@ -14,6 +14,8 @@ from winston.indexing.pipeline import run_indexing
 from winston.ingest.models import ImageMetadata, VideoMetadata
 from winston.ingest.probe import probe_media
 from winston.ingest.scanner import scan_media
+from winston.search.models import SearchResult
+from winston.search.pipeline import run_search
 
 PROGRESS_LOGGER = logging.getLogger("winston.progress")
 
@@ -25,6 +27,17 @@ def _format_duration(seconds: float) -> str:
     minutes, remainder = divmod(remainder, 60_000)
     secs, milliseconds = divmod(remainder, 1000)
     return f"{hours:02d}:{minutes:02d}:{secs:02d}.{milliseconds:03d}"
+
+
+def _positive_int(value: str) -> int:
+    """Parse one strictly positive integer for argparse result-count options."""
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("expected a positive integer") from exc
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("expected a positive integer")
+    return parsed
 
 
 @contextmanager
@@ -99,6 +112,56 @@ def index_command(root: Path, settings: Settings) -> int:
     return result.exit_code
 
 
+def _print_search_result(position: int, result: SearchResult) -> None:
+    """Print one ranked semantic result with raw score and exact visual provenance."""
+    print(f"{position}. {result.source_path}")
+    if result.start_timestamp_seconds is not None:
+        end = result.end_timestamp_seconds
+        representative = result.representative_timestamp_seconds
+        if end is None or representative is None:
+            raise ValueError("video search result is missing temporal provenance")
+        print(
+            "   passage: "
+            f"{_format_duration(result.start_timestamp_seconds)} -> {_format_duration(end)}"
+        )
+        print(f"   representative: {_format_duration(representative)}")
+    region = result.region
+    print(
+        f"   region: {result.region_kind.value} "
+        f"x={region.x} y={region.y} width={region.width} height={region.height} "
+        f"scale={region.scale:g}"
+    )
+    # Keep the cosine exactly as a raw score. It is not calibrated confidence and must
+    # not be rendered as a percentage.
+    print(f"   raw score: {result.raw_score:.6f}")
+
+
+def search_command(query: str, limit: int, settings: Settings) -> int:
+    """Run one asynchronous semantic search and map results or failures to CLI output."""
+    normalized_query = query.strip()
+    if not normalized_query:
+        print("Search failed: search query must not be blank", file=sys.stderr)
+        return 1
+
+    try:
+        results = asyncio.run(
+            run_search(
+                normalized_query,
+                limit=limit,
+                settings=settings,
+            )
+        )
+    except Exception as exc:
+        print(f"Search failed: {exc}", file=sys.stderr)
+        return 1
+
+    for position, result in enumerate(results, start=1):
+        if position > 1:
+            print()
+        _print_search_result(position, result)
+    return 0
+
+
 def build_parser(settings: Settings | None = None) -> argparse.ArgumentParser:
     """Build Winston's CLI parser from one runtime settings snapshot."""
     config = settings or get_config()
@@ -116,6 +179,18 @@ def build_parser(settings: Settings | None = None) -> argparse.ArgumentParser:
         help="Index local videos and photos into the configured visual index",
     )
     index_parser.add_argument("path", nargs="?", type=Path, default=config.data_dir)
+
+    search_parser = subparsers.add_parser(
+        "search",
+        help="Search the configured visual index with natural language",
+    )
+    search_parser.add_argument("query", help="Natural-language semantic search query")
+    search_parser.add_argument(
+        "--limit",
+        type=_positive_int,
+        default=int(config.search.result_limit),
+        help="Maximum number of grouped results to print",
+    )
     return parser
 
 
@@ -127,4 +202,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         return scan_command(args.path)
     if args.command == "index":
         return index_command(args.path, config)
+    if args.command == "search":
+        return search_command(args.query, args.limit, config)
     raise AssertionError(f"Unhandled command: {args.command}")
