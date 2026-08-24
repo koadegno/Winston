@@ -161,22 +161,34 @@ def build_temporal_windows(
     seeds: Sequence[TemporalObservation],
     *,
     context_seconds: float,
+    max_window_seconds: float,
 ) -> tuple[TemporalWindow, ...]:
-    """Expand coarse seeds by context and merge touching windows within each asset.
+    """Expand seeds, merge semantic neighborhoods, then split them at a hard duration bound.
 
     With a 15-second context, seeds at ``100s``, ``108s`` and ``310s`` first become
-    ``85..115``, ``93..123`` and ``295..325``. The first two overlap, so Winston
-    retrieves two complete neighborhoods: ``85..123`` and ``295..325``.
+    ``85..115``, ``93..123`` and ``295..325``. The first two overlap, so their union is
+    ``85..123``. A long transitive chain is still merged logically, but its union is
+    partitioned into contiguous windows no longer than ``max_window_seconds`` before
+    Qdrant refinement. Integer-microsecond coverage is preserved without overlap or gaps.
 
-    ``context_seconds`` is therefore a semantic parameter: changing it can change
-    which sampled moments are grouped into one passage. In contrast, ANN candidate
-    count and Qdrant timeline page size primarily bound discovery/runtime cost.
+    ``context_seconds`` is a semantic parameter because it changes which neighborhoods
+    touch. ``max_window_seconds`` is a runtime/resource hard bound: lowering it can split
+    one semantic neighborhood into several independently refined passages, but it never
+    silently expands the amount of video scanned by one refinement request.
     """
     if not math.isfinite(context_seconds) or context_seconds <= 0.0:
         raise ValueError("context_seconds must be finite and positive")
+    if not math.isfinite(max_window_seconds) or max_window_seconds <= 0.0:
+        raise ValueError("max_window_seconds must be finite and positive")
+
     context_us = round(context_seconds * MICROSECONDS_PER_SECOND)
+    max_window_us = round(max_window_seconds * MICROSECONDS_PER_SECOND)
     if context_us <= 0:
         raise ValueError("context_seconds is too small to represent in microseconds")
+    if max_window_us <= 0:
+        raise ValueError("max_window_seconds is too small to represent in microseconds")
+    if max_window_us < 2 * context_us:
+        raise ValueError("max_window_seconds must be >= 2 * context_seconds")
 
     expanded: list[TemporalWindow] = []
     for seed in seeds:
@@ -219,7 +231,30 @@ def build_temporal_windows(
         merged.append(current)
         current = candidate
     merged.append(current)
-    return tuple(merged)
+
+    bounded: list[TemporalWindow] = []
+    for window in merged:
+        start_timestamp_us = window.start_timestamp_us
+        while window.end_timestamp_us - start_timestamp_us > max_window_us:
+            end_timestamp_us = start_timestamp_us + max_window_us
+            bounded.append(
+                TemporalWindow(
+                    asset_id=window.asset_id,
+                    source_path=window.source_path,
+                    start_timestamp_us=start_timestamp_us,
+                    end_timestamp_us=end_timestamp_us,
+                )
+            )
+            start_timestamp_us = end_timestamp_us + 1
+        bounded.append(
+            TemporalWindow(
+                asset_id=window.asset_id,
+                source_path=window.source_path,
+                start_timestamp_us=start_timestamp_us,
+                end_timestamp_us=window.end_timestamp_us,
+            )
+        )
+    return tuple(bounded)
 
 
 def centered_moving_average(
