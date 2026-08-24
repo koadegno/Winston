@@ -2,9 +2,9 @@
 
 from enum import StrEnum
 from pathlib import Path
-from typing import Annotated, Literal
+from typing import Annotated, Literal, Self
 
-from pydantic import Field, FiniteFloat, PositiveInt, SecretStr, field_validator
+from pydantic import Field, FiniteFloat, PositiveInt, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -81,6 +81,13 @@ class SearchSettings(BaseSettings):
         if value % 2 == 0:
             raise ValueError("moving_average_frames must be odd")
         return value
+
+    @model_validator(mode="after")
+    def validate_candidate_bounds(self) -> Self:
+        """Keep the iterative ANN budget ordered so the maximum is a real hard bound."""
+        if self.candidate_max_limit < self.candidate_limit:
+            raise ValueError("candidate_max_limit must be >= candidate_limit")
+        return self
 
 
 # The engine field is the discriminator, so provider-specific settings cannot be mixed together.
