@@ -14,10 +14,13 @@ from winston.index.models import ScoredVisual, VisualVector
 from winston.index.qdrant import QdrantVisualIndex
 from winston.ingest.models import MediaType
 from winston.search.models import SearchResult, SearchRunError
+from winston.search.neighborhoods import (
+    bounded_refinement_window,
+    build_logical_temporal_neighborhoods,
+)
 from winston.search.temporal import (
     MICROSECONDS_PER_SECOND,
     TemporalObservationAccumulator,
-    build_temporal_windows,
     collapse_best_by_timestamp,
     cosine_similarity,
     select_passage,
@@ -42,10 +45,10 @@ class SearchPipeline:
     async def run(self, query: str, *, limit: int) -> tuple[SearchResult, ...]:
         """Execute one read-only semantic query and return grouped globally ranked results.
 
-        Qdrant ANN is used only to discover promising assets/timestamps. Video windows
-        are then read completely from the existing index and scored again with exact
-        local cosine, so weak intermediate keyframes are present for smoothing,
-        z-score normalization, and Kadane passage selection.
+        Qdrant ANN is used only to discover promising assets/timestamps. Each connected
+        video neighborhood contributes one semantic opportunity. Winston then chooses at
+        most one configured-size local refinement window around that neighborhood's
+        strongest coarse seed and scores the already-indexed visuals inside it exactly.
         """
         normalized_query, requested_limit = _validate_search_request(query, limit)
 
@@ -71,14 +74,18 @@ class SearchPipeline:
         )
         if video_matches:
             seed_observations = collapse_best_by_timestamp(video_matches)
-            windows = build_temporal_windows(
+            neighborhoods = build_logical_temporal_neighborhoods(
                 seed_observations,
                 context_seconds=float(self._settings.search.temporal_context_seconds),
-                max_window_seconds=float(
-                    self._settings.search.temporal_max_window_seconds
-                ),
             )
-            for window in windows:
+            max_window_seconds = float(
+                self._settings.search.temporal_max_window_seconds
+            )
+            for neighborhood in neighborhoods:
+                window = bounded_refinement_window(
+                    neighborhood,
+                    max_window_seconds=max_window_seconds,
+                )
                 local_observations = TemporalObservationAccumulator()
                 async for visual in self._visual_index.iter_visuals(
                     asset_id=window.asset_id,
@@ -142,10 +149,10 @@ class SearchPipeline:
         """Overfetch ANN points until grouping exposes enough distinct result opportunities.
 
         Raw Qdrant points are regions, not user-facing results. A single photo or one
-        video event can therefore consume many adjacent ANN ranks. Start with the
-        configured candidate budget, then double it only when grouping still exposes
-        fewer distinct photo assets/video neighborhoods than the requested result count.
-        The configured hard limit bounds the extra ANN work and memory.
+        connected video neighborhood can therefore consume many adjacent ANN ranks.
+        Overfetch continues until semantic grouping exposes enough distinct opportunities
+        or the configured hard candidate limit is reached. Runtime refinement caps are
+        deliberately excluded from this diversity calculation.
         """
         hard_limit = int(self._settings.search.candidate_max_limit)
         current_limit = min(
@@ -156,9 +163,6 @@ class SearchPipeline:
             hard_limit,
         )
         context_seconds = float(self._settings.search.temporal_context_seconds)
-        max_window_seconds = float(
-            self._settings.search.temporal_max_window_seconds
-        )
 
         while True:
             matches = tuple(
@@ -170,7 +174,6 @@ class SearchPipeline:
             opportunity_count = _coarse_result_opportunity_count(
                 matches,
                 context_seconds=context_seconds,
-                max_window_seconds=max_window_seconds,
             )
             if opportunity_count >= requested_limit:
                 return matches
@@ -187,9 +190,8 @@ def _coarse_result_opportunity_count(
     matches: Sequence[ScoredVisual],
     *,
     context_seconds: float,
-    max_window_seconds: float,
 ) -> int:
-    """Count grouped photo assets plus bounded video neighborhoods in raw ANN matches."""
+    """Count photo assets plus connected video neighborhoods before runtime capping."""
     photo_asset_ids = {
         match.visual.asset_id
         for match in matches
@@ -204,12 +206,11 @@ def _coarse_result_opportunity_count(
         return len(photo_asset_ids)
 
     video_observations = collapse_best_by_timestamp(video_matches)
-    video_windows = build_temporal_windows(
+    neighborhoods = build_logical_temporal_neighborhoods(
         video_observations,
         context_seconds=context_seconds,
-        max_window_seconds=max_window_seconds,
     )
-    return len(photo_asset_ids) + len(video_windows)
+    return len(photo_asset_ids) + len(neighborhoods)
 
 
 def _validate_search_request(query: str, limit: int) -> tuple[str, int]:
