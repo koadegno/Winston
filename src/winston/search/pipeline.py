@@ -57,13 +57,9 @@ class SearchPipeline:
             expected_dimension=self._embedder.identity.dimension,
         )
 
-        candidate_limit = max(
-            int(self._settings.search.candidate_limit),
-            requested_limit,
-        )
-        coarse_matches = await self._visual_index.search_visuals(
+        coarse_matches = await self._discover_coarse_matches(
             query_vector,
-            limit=candidate_limit,
+            requested_limit=requested_limit,
         )
 
         results: list[SearchResult] = list(_photo_results(coarse_matches))
@@ -132,6 +128,78 @@ class SearchPipeline:
 
         results.sort(key=_result_order_key)
         return tuple(results[:requested_limit])
+
+    async def _discover_coarse_matches(
+        self,
+        query_vector: VisualVector,
+        *,
+        requested_limit: int,
+    ) -> tuple[ScoredVisual, ...]:
+        """Overfetch ANN points until grouping exposes enough distinct result opportunities.
+
+        Raw Qdrant points are regions, not user-facing results. A single photo or one
+        video event can therefore consume many adjacent ANN ranks. Start with the
+        configured candidate budget, then double it only when grouping still exposes
+        fewer distinct photo assets/video neighborhoods than the requested result count.
+        The configured hard limit bounds the extra ANN work and memory.
+        """
+        current_limit = max(
+            int(self._settings.search.candidate_limit),
+            requested_limit,
+        )
+        hard_limit = max(
+            current_limit,
+            int(self._settings.search.candidate_max_limit),
+        )
+        context_seconds = float(self._settings.search.temporal_context_seconds)
+
+        while True:
+            matches = tuple(
+                await self._visual_index.search_visuals(
+                    query_vector,
+                    limit=current_limit,
+                )
+            )
+            opportunity_count = _coarse_result_opportunity_count(
+                matches,
+                context_seconds=context_seconds,
+            )
+            if opportunity_count >= requested_limit:
+                return matches
+            if len(matches) < current_limit or current_limit >= hard_limit:
+                return matches
+
+            next_limit = min(hard_limit, current_limit * 2)
+            if next_limit <= current_limit:
+                return matches
+            current_limit = next_limit
+
+
+def _coarse_result_opportunity_count(
+    matches: Sequence[ScoredVisual],
+    *,
+    context_seconds: float,
+) -> int:
+    """Count grouped photo assets plus merged video neighborhoods in raw ANN matches."""
+    photo_asset_ids = {
+        match.visual.asset_id
+        for match in matches
+        if match.visual.media_type is MediaType.IMAGE
+    }
+    video_matches = tuple(
+        match
+        for match in matches
+        if match.visual.media_type is MediaType.VIDEO
+    )
+    if not video_matches:
+        return len(photo_asset_ids)
+
+    video_observations = collapse_best_by_timestamp(video_matches)
+    video_windows = build_temporal_windows(
+        video_observations,
+        context_seconds=context_seconds,
+    )
+    return len(photo_asset_ids) + len(video_windows)
 
 
 def _validate_search_request(query: str, limit: int) -> tuple[str, int]:
