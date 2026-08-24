@@ -63,9 +63,11 @@ class IndexingSettings(BaseSettings):
 class SearchSettings(BaseSettings):
     """Settings that bound semantic retrieval and local temporal refinement."""
 
-    # result_limit/candidate_limit/timeline_page_size primarily bound output or retrieval cost.
+    # Retrieval starts at candidate_limit and may overfetch up to candidate_max_limit
+    # when raw ANN points collapse into too few user-facing photo/video neighborhoods.
     result_limit: PositiveInt = 10
     candidate_limit: PositiveInt = 200
+    candidate_max_limit: PositiveInt = 2_000
     timeline_page_size: PositiveInt = 256
 
     # These two values can change the semantic extent selected for a video passage.
