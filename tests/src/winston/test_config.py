@@ -138,6 +138,7 @@ def test_search_settings_have_v0_defaults() -> None:
     assert Settings().model_dump().get("search") == {
         "result_limit": 10,
         "candidate_limit": 200,
+        "candidate_max_limit": 2_000,
         "temporal_context_seconds": 15.0,
         "moving_average_frames": 3,
         "timeline_page_size": 256,
@@ -150,6 +151,7 @@ def test_search_settings_read_nested_environment_overrides(
     """SEARCH__ overrides must use the same nested environment convention as other settings."""
     monkeypatch.setenv("SEARCH__RESULT_LIMIT", "7")
     monkeypatch.setenv("SEARCH__CANDIDATE_LIMIT", "80")
+    monkeypatch.setenv("SEARCH__CANDIDATE_MAX_LIMIT", "640")
     monkeypatch.setenv("SEARCH__TEMPORAL_CONTEXT_SECONDS", "9.5")
     monkeypatch.setenv("SEARCH__MOVING_AVERAGE_FRAMES", "5")
     monkeypatch.setenv("SEARCH__TIMELINE_PAGE_SIZE", "64")
@@ -157,6 +159,7 @@ def test_search_settings_read_nested_environment_overrides(
     assert Settings().model_dump().get("search") == {
         "result_limit": 7,
         "candidate_limit": 80,
+        "candidate_max_limit": 640,
         "temporal_context_seconds": 9.5,
         "moving_average_frames": 5,
         "timeline_page_size": 64,
@@ -168,6 +171,7 @@ def test_search_settings_read_nested_environment_overrides(
     [
         ("result_limit", 0),
         ("candidate_limit", 0),
+        ("candidate_max_limit", 0),
         ("temporal_context_seconds", 0.0),
         ("timeline_page_size", 0),
     ],
