@@ -25,17 +25,17 @@ The baseline must not tune itself to the results it is measuring.
 Phase 1G must:
 
 - create a versioned semantic-search benchmark manifest backed by fixed real Winston media;
-- pin the benchmark media to an immutable release asset digest rather than commit footage to Git;
-- represent positive events, known hard negatives, query language, query family, and cross-language/synonym equivalence groups explicitly;
-- evaluate the existing Phase 1F search behavior without changing its ranking, temporal selection, crops, embedding model, or score semantics;
+- pin benchmark media to immutable archive and extracted-file digests rather than commit footage to Git;
+- represent positive events, known hard negatives, query language, semantic family, and cross-language/synonym equivalence explicitly;
+- evaluate existing Phase 1F behavior without changing ranking, temporal selection, crops, embedding model, or score semantics;
 - compute deterministic per-query and aggregate semantic-quality metrics;
 - separate semantic retrieval quality from temporal localization quality;
-- measure indexing throughput, vectors per hour of video, end-to-end query latency, and Qdrant ANN latency separately;
+- measure indexing throughput, video vectors per hour of footage, end-to-end query latency, and Qdrant ANN latency separately;
 - preserve enough run provenance to compare later models, region strategies, query processing, rerankers, and no-match policies;
 - provide a CLI that emits machine-readable JSON suitable for GitHub Actions artifacts and later comparison;
 - keep normal CI fast and provider-free by testing evaluation logic with deterministic fakes/fixtures;
-- provide an explicit GitHub Actions path for the real baseline using the pinned release, Qdrant, and the configured Jina provider;
-- remain class-agnostic: benchmark labels describe what is visible, but they do not become detector classes or indexing requirements.
+- provide an explicit GitHub Actions path for the real baseline using the pinned release, Qdrant, and configured Jina provider;
+- remain class-agnostic: benchmark labels describe what is visible, but they never become detector classes or indexing requirements.
 
 ## Non-goals
 
@@ -46,17 +46,17 @@ Phase 1G does not:
 - change fixed crops/tiles or add region proposals;
 - add a VLM/reranker;
 - add a no-match threshold or convert cosine into a confidence percentage;
-- change ANN candidate limits, temporal grouping, local cosine scoring, moving average, z-score, or Kadane behavior to improve benchmark numbers;
+- tune ANN candidate limits, temporal grouping, local cosine scoring, moving average, z-score, or Kadane to improve benchmark numbers;
 - decode additional P-frames or implement Phase 2 temporal refinement;
-- introduce MLflow, notebooks as the canonical benchmark, a database of experiment runs, or a dashboard;
+- introduce MLflow, a database of experiment runs, notebooks as the canonical benchmark, or a dashboard;
 - commit the 844 MB media release to the repository;
 - infer ground truth from the current search ranking.
 
-A benchmark that is labeled by accepting the current model's own top results as truth would be circular and is explicitly forbidden.
+A benchmark labeled by accepting the current model's own top results as truth would be circular and is explicitly forbidden.
 
 ## Why a dedicated evaluation subsystem
 
-A one-off script would be enough to print a few Recall@K values, but issue #32 already requires repeated comparisons across language handling, crop strategies, embedding models, compositional scoring, reranking, and no-match behavior. The benchmark therefore needs stable typed boundaries without becoming a full experiment-management platform.
+A one-off script could print a few Recall@K values, but issue #32 requires repeated comparisons across language handling, crop strategies, embedding models, compositional scoring, reranking, and no-match behavior. The benchmark therefore needs stable typed boundaries without becoming a full experiment-management platform.
 
 The chosen architecture is:
 
@@ -65,8 +65,8 @@ benchmarks/semantic-search/v1/manifest.json
         │
         ├─ dataset provenance
         ├─ fixed queries
-        ├─ positive truth events
-        ├─ annotated hard negatives
+        ├─ neutral truth events
+        ├─ positive / hard-negative query-event references
         └─ metric cutoffs
         │
         v
@@ -85,7 +85,9 @@ winston evaluate semantic ...
 machine-readable baseline JSON
 ```
 
-The core search/indexing subsystems remain the system under test. Evaluation code consumes their public Winston-owned contracts and does not move benchmark-specific rules into `src/winston/search` or `src/winston/indexing`.
+The core search/indexing subsystems remain the system under test. Evaluation code consumes Winston-owned contracts and does not move benchmark-specific rules into `src/winston/search` or `src/winston/indexing`.
+
+New Phase 1G production code and tests use precise Python types. `typing.Any` and `object` are not used as escape hatches for benchmark data, results, or instrumentation.
 
 ## Fixed dataset provenance
 
@@ -99,17 +101,40 @@ size:          844175165 bytes
 sha256:        94fa6b655e4118401fb724736d5e21f5e34d52b677f91562af9297e4a08201b6
 ```
 
-The manifest records the release tag, asset name, byte size, SHA-256 digest, and the exact source paths it expects after extraction. A real benchmark run must fail before indexing if the downloaded asset digest or expected media inventory does not match the manifest.
+The manifest records both archive identity and the exact extracted media inventory.
 
-This provides two independent identities:
+Archive provenance contains:
 
 ```text
-benchmark manifest version
-        +
-media release digest
+release_tag
+asset_name
+asset_size_bytes
+archive_sha256
 ```
 
-Changing annotations/queries creates a new benchmark manifest version. Changing media creates a new pinned dataset identity. Historical benchmark results therefore remain interpretable.
+Each expected extracted media entry contains:
+
+```text
+source_path
+size_bytes
+sha256
+```
+
+`source_path` is a normalized POSIX-style path relative to the extracted dataset root, with no absolute path or `..` traversal.
+
+The manual real-baseline workflow validates the downloaded archive size/digest before extraction. The evaluator validates every extracted media path, size, and SHA-256, so `--mode search` remains reproducible even when the original ZIP is no longer present locally.
+
+This provides stable identities for:
+
+```text
+benchmark manifest
+        +
+release archive
+        +
+extracted media inventory
+```
+
+Changing annotations/queries creates a new benchmark manifest version. Changing media creates a new pinned dataset identity. Historical results therefore remain interpretable.
 
 ## Benchmark manifest
 
@@ -121,56 +146,61 @@ benchmarks/semantic-search/v1/manifest.json
 
 The JSON is data, not executable configuration. It is parsed into strict Winston-owned models with unknown fields rejected.
 
-Conceptual structure:
+Top-level v1 fields are:
 
-```json
-{
-  "schema_version": 1,
-  "benchmark_id": "winston-semantic-v1",
-  "dataset": {
-    "release_tag": "test-dataset-v1",
-    "asset_name": "videos.zip",
-    "asset_size_bytes": 844175165,
-    "sha256": "94fa6b655e4118401fb724736d5e21f5e34d52b677f91562af9297e4a08201b6",
-    "expected_source_paths": ["..."]
-  },
-  "cutoffs": [1, 3, 5, 10],
-  "queries": [
-    {
-      "id": "...",
-      "text": "red bicycle",
-      "language": "en",
-      "family": "attribute_binding",
-      "equivalence_group": "red-bicycle",
-      "expect_no_match": false,
-      "positives": ["event-red-bicycle-001"],
-      "hard_negatives": ["negative-red-person-black-bike-001"]
-    }
-  ],
-  "events": ["... typed event objects ..."]
-}
+```text
+schema_version = 1
+benchmark_id = "winston-semantic-v1"
+dataset
+cutoffs
+queries
+events
 ```
 
-The actual schema uses typed objects rather than stringly-typed arbitrary dictionaries.
+The first fixed cutoffs are:
+
+```text
+1, 3, 5, 10
+```
+
+They are part of the manifest, not CLI tuning flags for the canonical baseline.
+
+### Dataset section
+
+The dataset section contains the release/archive fields above plus `expected_media`, where every extracted file has a path, size, and SHA-256.
+
+The v1 implementation computes these per-file identities from the existing `test-dataset-v1` release before freezing the manifest. Files not present in the pinned release cannot appear in truth annotations.
 
 ### Query identity
 
 Each query has:
 
-- stable `id`;
-- exact query `text` sent to Phase 1F unchanged;
-- explicit `language`, initially `en` or `fr`;
-- one `family`;
-- optional `equivalence_group` for translations/synonyms that express the same intent;
-- `expect_no_match`;
-- referenced positive event IDs;
-- referenced hard-negative event IDs.
+```text
+id
+text
+language
+family
+variant_kind
+equivalence_group (optional)
+expect_no_match
+positive_event_ids
+hard_negatives
+```
 
-The query text is benchmark data. The runner must not translate, rewrite, normalize beyond the existing search pipeline's normal whitespace handling, or generate extra prompts.
+`hard_negatives` is a list of query-specific references:
 
-### Query families
+```text
+event_id
+reason
+```
 
-The initial controlled vocabulary is:
+The reason belongs to the query-event relationship, not to the neutral event itself. The same visible interval may be a `wrong_color` negative for one query and a `confusable_object` negative for another.
+
+The exact `text` is sent to Phase 1F unchanged. The runner must not translate, rewrite, expand, or generate alternate prompts. Existing search-pipeline whitespace validation remains the only normal query normalization.
+
+### Semantic query families
+
+The controlled v1 `family` vocabulary is:
 
 ```text
 simple_object
@@ -180,17 +210,41 @@ attribute_binding
 person_clothing
 person_object_relation
 confusable_object
-synonym
-absent
 ```
 
-Language is stored independently rather than encoded into the family, so the same family can be compared between French and English.
+Family describes the semantic challenge. Language and wording variation are separate dimensions.
 
-These categories are evaluation metadata only. Winston indexing/search never receives them.
+### Variant kind
+
+`variant_kind` is one of:
+
+```text
+canonical
+translation
+synonym
+```
+
+This avoids classifying `pram` only as a synonym when it is also semantically a confusable-object query. A query can therefore be:
+
+```text
+family = confusable_object
+variant_kind = synonym
+```
+
+### Language
+
+Initial languages are explicitly:
+
+```text
+en
+fr
+```
+
+Language is metadata only. It does not alter execution.
 
 ### Equivalence groups
 
-Queries that should mean the same thing share an `equivalence_group`, for example:
+Queries expressing the same intended visual condition share `equivalence_group`, for example:
 
 ```text
 stroller / pram / pushchair
@@ -198,11 +252,11 @@ une poussette / a stroller
 une personne avec un t-shirt blanc / a person with a white T-shirt
 ```
 
-Equivalence groups permit paired language/synonym reporting without merging their actual retrieval runs. Each text query is still executed independently.
+The group permits paired language/synonym reporting without merging retrieval runs. Every exact text query is still evaluated independently.
 
 ## Ground-truth event model
 
-Ground truth describes real visible events in the pinned release. It must be human-verified independently of Winston's rank ordering. Search output may help navigate footage during annotation, but it is evidence to inspect, not authority for the label.
+`events` are neutral, reusable descriptions of real visible intervals in the pinned release. Positivity and hard-negative meaning are assigned by each query.
 
 A truth event contains:
 
@@ -213,24 +267,32 @@ media_type
 start_timestamp_seconds
 end_timestamp_seconds
 optional region annotation
-annotation note
+annotation_note
 ```
 
-For video, timestamps are finite, non-negative, and ordered. For still images, timestamps are absent and source identity is sufficient.
+For video:
 
-An optional manually verified region can document where the relevant object is visible, but Phase 1G semantic relevance does **not** require tile/box IoU. Current Phase 1F regions are intentionally coarse deterministic crops; making exact region overlap part of the first pass would conflate crop localization with whether Winston found the correct visual event.
+- timestamps are finite and non-negative;
+- `end_timestamp_seconds > start_timestamp_seconds`;
+- no hidden timing tolerance is added by evaluation.
 
-Region-specific evaluation can be added as a later benchmark version without changing Phase 1G's semantic definition.
+If annotation uncertainty requires a wider valid interval, that uncertainty must be represented explicitly in the truth interval itself.
+
+For still images, timestamps are absent and source identity is sufficient.
+
+An optional manually verified region can document where the relevant object is visible, but Phase 1G semantic relevance does **not** require region/tile IoU. Current Phase 1F regions are intentionally coarse deterministic crops; exact spatial overlap would conflate crop localization with whether Winston found the correct visual event.
+
+Region-specific evaluation can be introduced in a later benchmark version without rewriting v1.
 
 ### Positive events
 
-A positive event means the query is genuinely satisfied in that media interval.
+A query's `positive_event_ids` reference events where that exact query condition is genuinely satisfied.
 
 Examples include the interval in which a cyclist is visible or the interval in which a person is actually wearing the requested clothing color.
 
 ### Hard negatives
 
-A hard negative is an explicitly annotated interval that is visually/semantically tempting but does **not** satisfy the query. It records a reason from a controlled vocabulary such as:
+A query-specific hard negative references a tempting but wrong event and assigns one reason:
 
 ```text
 wrong_attribute_binding
@@ -241,49 +303,68 @@ wrong_relation
 other
 ```
 
-Examples from issue #32 include:
+Examples from issue #32:
 
 ```text
 query: red bicycle
-hard negative: red clothing/person next to a non-red bicycle
+negative: red clothing/person next to a non-red bicycle
+reason: wrong_attribute_binding
 
 query: person wearing a yellow T-shirt
-hard negative: person carrying a yellow bag while the shirt is not yellow
+negative: person carrying a yellow bag while the shirt is not yellow
+reason: wrong_attribute_binding
 
 query: stroller
-hard negative: bicycle/cyclist scene
+negative: bicycle/cyclist scene
+reason: confusable_object
 ```
 
-Hard negatives make failures diagnosable instead of treating every wrong result as one undifferentiated false positive.
+Hard negatives make failures diagnosable instead of treating every wrong result as undifferentiated noise.
 
 ### Absent queries
 
-An absent query has:
+An absent query is represented by:
 
 ```text
 expect_no_match = true
-positives = []
+positive_event_ids = []
 ```
 
-It can still reference known hard negatives. A manifest entry may not simultaneously declare `expect_no_match=true` and positive events.
+It still has a real semantic family and may reference known hard negatives. `absent` is therefore not a semantic family.
+
+A query may not simultaneously declare `expect_no_match=true` and positive events. Conversely, a positive benchmark query must contain at least one positive event.
 
 Phase 1F currently returns best-available neighbors rather than abstaining, so poor absent-query behavior is an expected baseline result, not something Phase 1G should hide with a threshold.
 
-## Semantic relevance rule
+## Canonical retrieval depth
 
-Phase 1G deliberately evaluates the representative visual selected by Phase 1F rather than allowing a very wide returned passage to count as correct merely because it overlaps a truth interval somewhere.
-
-A video result semantically matches a positive truth event when:
+Every benchmark query is executed **once** with:
 
 ```text
-result.source_path == truth.source_path
-AND
-truth.start <= result.representative_timestamp <= truth.end
+limit = max(manifest.cutoffs)
 ```
 
-A still-image result matches when its source path equals the truth source path.
+All Recall@K/Precision@K values are prefixes of that single ranked list.
 
-This rule isolates the question:
+This matters because Phase 1F's ANN overfetch behavior can depend on requested result count. Phase 1G therefore measures one explicitly defined retrieval depth rather than pretending that `Recall@1` is the same experiment as executing the CLI separately with `--limit 1`.
+
+The canonical v1 benchmark evaluates the ranking produced for `limit=10`, then measures prefixes K=1,3,5,10. Future benchmark versions may change this contract explicitly, but a single v1 run never executes one query multiple times merely to compute several cutoffs.
+
+## Semantic relevance rule
+
+Phase 1G evaluates the representative visual selected by Phase 1F rather than allowing a broad returned passage to count as correct merely because it overlaps a truth interval somewhere.
+
+A video result can match a positive event when:
+
+```text
+result.source_path == event.source_path
+AND
+event.start <= result.representative_timestamp <= event.end
+```
+
+A still-image result can match when source paths are equal.
+
+This isolates the question:
 
 > Did semantic retrieval select a visual moment that actually satisfies the query?
 
@@ -291,32 +372,32 @@ Returned passage boundaries are evaluated separately.
 
 ### Deterministic one-to-one matching
 
-Within top K, ranked results are matched to positive truth events in order. Each positive truth event can be claimed at most once.
+Within the ranked prefix, results are processed in rank order. Each positive event can be claimed at most once.
 
-If a result can match multiple still-unmatched truth events, the runner selects deterministically by:
+If one result can match multiple still-unmatched positive events, choose deterministically by:
 
-1. smallest distance between representative timestamp and truth-interval center;
-2. then stable truth-event ID.
+1. smallest distance between representative timestamp and event-interval center;
+2. stable event ID.
 
-A second result that points to an already-claimed positive event does not create extra recall and is treated as an unmatched result for precision. This prevents duplicate result windows from manufacturing benchmark quality.
+A later result pointing to an already-claimed positive event does not create extra recall and is unmatched for precision. Duplicate result windows therefore cannot manufacture benchmark quality.
 
-Hard-negative attribution is evaluated after positive matching. An unmatched result whose representative lands in an annotated hard-negative interval is labeled with that hard-negative reason; otherwise it is a generic false positive.
+Hard-negative attribution occurs after positive matching. An unmatched result whose representative falls in a query's hard-negative event is labeled with that query-event reason; otherwise it is a generic false positive.
 
 ## Semantic quality metrics
 
-Metrics are computed per query first, then aggregated. The raw per-query records remain in the result JSON so later analysis never depends only on a single headline number.
+Metrics are computed per query first, then aggregated. Raw per-query judgments remain in result JSON so later analysis never depends only on a headline number.
 
 ### Recall@K
 
 For positive queries:
 
 ```text
-unique positive truth events matched in top K
----------------------------------------------
-        total positive truth events
+unique positive events matched in top K
+---------------------------------------
+        total positive events
 ```
 
-Absent queries have no Recall@K denominator and are excluded from positive-query macro recall.
+Absent queries have no Recall@K denominator and are excluded from positive-query recall aggregates.
 
 ### Precision@K
 
@@ -328,45 +409,65 @@ one-to-one positive matches in top K
                    K
 ```
 
-If the engine returns fewer than K results, unfilled ranks count as non-relevant for this metric. This prevents a future implementation from improving Precision@K simply by returning almost nothing. Abstention/no-match behavior is reported separately.
+Unfilled ranks count as non-relevant. This prevents a future implementation from improving Precision@K merely by returning almost nothing. Abstention behavior is reported separately.
 
-### First relevant rank and reciprocal rank
+### First relevant rank and MRR
 
 For each positive query:
 
-- `first_relevant_rank`: 1-based rank of the first one-to-one positive match, or null if absent;
-- reciprocal rank: `1 / first_relevant_rank`, or zero if no positive is found.
+- `first_relevant_rank` is the 1-based first positive-match rank, or null;
+- reciprocal rank is `1 / first_relevant_rank`, or zero when no positive is found.
 
-Aggregate MRR is reported across positive queries.
+MRR is the macro mean reciprocal rank across positive queries.
 
-### Success@K
+### Success@K and family accuracy
 
-A positive query succeeds at K if at least one positive event is found in top K.
+A positive query has `success@K = true` when at least one positive event is found in top K.
 
-This becomes the basis for interpretable family-specific rates such as:
+Family metrics named as accuracies are defined exactly as macro Success@K for that family, for example:
 
 ```text
 attribute_binding_accuracy@K
 confusable_object_accuracy@K
 ```
 
-These names mean macro `Success@K` across the corresponding benchmark family; they are not probabilities and are not model confidence values.
+They are empirical benchmark rates, not probabilities and not model confidence.
+
+### Aggregate recall/precision
+
+Primary aggregate values are macro means across eligible positive queries:
+
+```text
+macro_recall@K
+macro_precision@K
+```
+
+The result document also preserves numerator/denominator counts so micro summaries can be derived without re-running the benchmark.
 
 ### Hard-negative rate@K
 
-For each query/family, report the fraction of inspected top-K ranks attributed to annotated hard negatives, plus counts by hard-negative reason.
+Hard-negative diagnostics use only actually returned ranks in the top-K prefix:
 
-This distinguishes failures such as wrong attribute binding from unrelated nearest-neighbor noise.
+```text
+annotated hard-negative results in returned top-K
+-------------------------------------------------
+        number of results actually returned in top-K
+```
+
+If no result is returned, the rate is null and counts are zero. Counts by hard-negative reason are always emitted.
+
+This diagnostic is distinct from Precision@K, whose denominator remains K.
 
 ### Language and synonym consistency
 
-For each `equivalence_group`, preserve the per-query metrics and report pair/group gaps, including:
+For each `equivalence_group`, preserve per-query metrics and report:
 
-- difference in Recall@K;
-- difference in first relevant rank when both queries retrieve a positive;
-- whether one formulation succeeds at K while an equivalent formulation fails.
+- Recall@K range/gap;
+- first-relevant-rank differences when comparable;
+- success/failure disagreement at K;
+- language and variant labels for each member.
 
-The benchmark does not average query embeddings or fuse equivalent queries. Consistency reporting observes the current model as-is.
+The benchmark does not average embeddings or fuse equivalent queries. Consistency reporting observes current behavior as-is.
 
 ### No-match behavior
 
@@ -375,52 +476,54 @@ For `expect_no_match=true` queries, report:
 - returned result count;
 - whether the engine abstained completely;
 - top raw cosine score when present;
-- top-K raw score distribution;
-- annotated hard-negative hits.
+- top-K raw score list/distribution;
+- annotated hard-negative hits by reason.
 
-Aggregate outputs include `no_match_abstention_rate` and absent-query score summaries.
+Aggregate outputs include `no_match_abstention_rate` plus absent-query raw-score summaries.
 
-Phase 1G does not decide a threshold from these numbers. They provide calibration evidence for later #32 experiments.
+Phase 1G does not derive a rejection threshold from these numbers. They are calibration evidence for later #32 work.
 
 ## Temporal localization metrics
 
 Semantic correctness and temporal precision are separate dimensions.
 
-For each semantically matched video result, compare its returned passage to the matched truth interval and report:
+For each semantically matched video result, compare returned passage bounds with the matched event interval and report:
 
-- start error in seconds;
-- end error in seconds;
+- signed start error in seconds (`result_start - truth_start`);
+- signed end error in seconds (`result_end - truth_end`);
 - passage duration;
 - truth duration;
 - temporal intersection-over-union (tIoU).
 
-A semantically correct representative can therefore receive full semantic credit while still exposing an overly broad Phase 1F passage. Conversely, passage overlap alone cannot rescue a semantically wrong representative.
+A semantically correct representative can receive semantic credit while exposing an overly broad Phase 1F passage. Passage overlap alone cannot rescue a semantically wrong representative.
 
 This prevents Phase 2 localization work from being confused with embedding/retrieval quality.
 
 ## Performance measurements
 
-Performance measurements are reported independently from semantic metrics.
+Performance metrics are reported independently from semantic metrics.
 
 ### Instrumentation boundary
 
-Phase 1G must not add benchmark-specific methods to `VisualIndex` or change search/indexing semantics merely to obtain timings.
+Phase 1G does not add benchmark-specific methods to `VisualIndex` or change search/indexing semantics merely to obtain timings.
 
-Instead, `evaluation.instrumentation` provides a typed delegating `VisualIndex` wrapper used only by the benchmark runner. It implements the same Winston `VisualIndex` protocol and records:
+`evaluation.instrumentation` instead provides a typed delegating `VisualIndex` wrapper used only by the benchmark runner. It implements the same Winston protocol and records:
 
-- number of visuals passed through `upsert()` during the measured indexing run;
-- duration of ANN `search_visuals()` calls;
-- optional total duration spent streaming refinement windows through `iter_visuals()`.
+- total visuals passed to `upsert()`;
+- video visuals passed to `upsert()`;
+- still-image visuals passed to `upsert()`;
+- duration of each ANN `search_visuals()` call;
+- total duration spent streaming refinement windows through `iter_visuals()` when applicable.
 
-All actual storage behavior remains delegated to the real index implementation.
+All real storage behavior remains delegated to the underlying index.
 
 This keeps Qdrant SDK types inside the existing Qdrant adapter and keeps evaluation provider-agnostic.
 
 ### Indexing throughput
 
-A full baseline run uses an empty/dedicated evaluation Qdrant instance/collection and a freshly extracted pinned dataset.
+A canonical full baseline uses an empty/dedicated evaluation Qdrant instance/collection and freshly extracted pinned media.
 
-The runner records wall-clock duration around `IndexingPipeline.run()` and independently computes total video duration by probing the fixed dataset.
+The runner records wall-clock duration around `IndexingPipeline.run()` and independently computes total video duration by probing the verified dataset.
 
 Report at least:
 
@@ -428,16 +531,18 @@ Report at least:
 indexing_wall_seconds
 video_footage_seconds
 footage_hours_per_wall_hour
-upserted_visual_count
-vectors_per_footage_hour
+total_upserted_visual_count
+video_visual_count
+image_visual_count
+video_vectors_per_footage_hour
 indexed_assets
 failed_assets
 skipped_assets
 ```
 
-A canonical cold baseline run is invalid if any asset was skipped or failed. This prevents restart/idempotency behavior from being mistaken for fresh indexing throughput.
+`video_vectors_per_footage_hour` uses only video visuals in the numerator. Still-image vectors remain explicit but never inflate a per-video-hour rate.
 
-Still images contribute vectors and indexing work but not video-footage hours. Their counts remain explicit in run provenance.
+A canonical cold baseline is invalid if any asset is skipped or failed. This prevents restart/idempotency behavior from being mistaken for fresh indexing throughput.
 
 ### Search latency
 
@@ -446,99 +551,107 @@ For every benchmark query, report separately:
 ```text
 end_to_end_search_ms
 qdrant_ann_ms
-refinement_scroll_ms (when video refinement occurs)
+refinement_scroll_ms
 ```
 
-Aggregate latency summaries include count, mean, median/p50, and p95. Raw samples are retained in the result JSON.
+`qdrant_ann_ms` is the sum of actual `search_visuals()` calls for that query, including bounded ANN overfetch. It excludes text embedding, exact local cosine, and temporal selection. End-to-end latency contains the complete current search pipeline.
 
-`qdrant_ann_ms` measures the actual `search_visuals()` call(s), including bounded ANN overfetch when Phase 1F performs it. It does not include text embedding, local exact cosine, or temporal passage selection. End-to-end latency does include the complete current search pipeline.
+`refinement_scroll_ms` is zero when no video refinement occurs and otherwise records time spent obtaining indexed visuals through the delegated timeline iterator.
 
-No concurrent query load generator is added in Phase 1G; measurements are single-query sequential baseline measurements.
+Aggregate latency summaries contain:
+
+```text
+count
+mean
+p50
+p95
+```
+
+`p50` is the ordinary median. `p95` uses deterministic nearest-rank selection: sort ascending and take rank `ceil(0.95 * n)`, clamped to the available sample count. Raw samples are retained.
+
+Each fixed query executes once, sequentially. Phase 1G is a reproducible baseline, not a concurrency/load benchmark, so these latency numbers are descriptive rather than a claim about production tail latency under load.
 
 ## Runner and CLI
 
-The user-facing command is:
+User-facing command:
 
 ```text
-winston evaluate semantic <manifest> --dataset-root <path> --output <results.json>
+winston evaluate semantic <manifest> --dataset-root <path> --output <results.json> --mode <search|full>
 ```
 
-The runner has two explicit execution modes:
+`--mode` is mandatory so a caller never accidentally triggers expensive indexing.
 
-```text
---mode search
---mode full
-```
+### Search mode
 
-### `--mode search`
+`--mode search`:
 
-- validates the benchmark manifest and local media inventory/digests;
+- validates manifest and every extracted media path/size/SHA-256;
 - opens the existing compatible configured visual index read-only;
-- runs every query through the current `SearchPipeline`;
+- executes every exact manifest query once at canonical retrieval depth;
 - emits semantic, temporal, and search-latency metrics;
-- does not modify/rebuild the index.
+- does not invoke mutating index operations.
 
-This mode is useful for repeated local comparisons against an already prepared index.
+### Full mode
 
-### `--mode full`
+`--mode full`:
 
-- validates the manifest and media first;
+- validates manifest/media first;
 - runs the existing `IndexingPipeline` against the configured dedicated evaluation collection;
 - requires a cold run (`skipped == 0`, `failed == 0`);
 - records indexing metrics through the instrumentation wrapper;
-- then executes the same search evaluation;
+- executes the same search evaluation afterward;
 - emits one combined result document.
 
-The CLI never silently deletes or recreates a user's collection. The canonical full baseline GitHub Action supplies a fresh Qdrant service/collection. A local full run is the caller's responsibility to point at a dedicated empty evaluation target; if cold-run invariants are violated, the benchmark fails rather than publishing misleading throughput.
+The CLI never silently deletes or recreates a user's collection. The canonical GitHub Action supplies fresh Qdrant. A local full run is the caller's responsibility to point at a dedicated empty evaluation target; violated cold-run invariants fail rather than publish misleading throughput.
 
-CLI fatal validation/runtime failures go to stderr and return non-zero. Machine-readable benchmark output goes only to the requested JSON path, avoiding progress logs mixed into the artifact.
+Fatal manifest/runtime/output failures go to stderr and return non-zero. The benchmark result is written only to the requested JSON file, so progress logs never corrupt machine-readable output.
 
 ## Result document and reproducibility
 
-The result JSON has its own schema version and contains at least:
+Result JSON has an independent schema version and contains at least:
 
 ```text
 result_schema_version
 benchmark_id
 manifest_sha256
-dataset release/digest provenance
-run timestamp UTC
+dataset archive and extracted-media provenance
+run_timestamp_utc
 Winston revision when available
 embedding identity
-search settings snapshot
-index/Qdrant settings relevant to semantics/performance
+semantic/resource search settings snapshot
+relevant index/Qdrant settings
 per-query ranked judgments
 per-query metrics
-aggregate semantic metrics
-family metrics
-equivalence-group/language metrics
+macro/family metrics
+equivalence-group metrics
 temporal localization metrics
 performance samples and summaries
 ```
 
-Secrets, API keys, raw vectors, and raw media are never written into the result document.
+Secrets, API keys, raw vectors, and raw media are never written.
 
-The exact manifest SHA-256 is recorded so two result artifacts can immediately establish whether they used identical benchmark definitions.
+The exact manifest SHA-256 is recorded so two artifacts immediately reveal whether they used identical benchmark definitions. Search settings that affect semantic behavior or resource bounds are captured because candidate limits or temporal context changes make runs materially different.
 
-Search settings that affect semantics or resource bounds are captured because a comparison between two runs is not meaningful if, for example, candidate limits or temporal context silently changed.
+All numeric JSON values are finite. Mathematically inapplicable metrics are `null`, never NaN or Infinity.
 
 ## Initial benchmark content
 
-The first version should deliberately cover the failure modes already observed during Phase 1F manual testing, not only easy positive queries.
+V1 deliberately covers observed Phase 1F failure modes, not only easy positives.
 
-Candidate query intents include:
+Candidate intents include:
 
 ```text
-simple object:
+simple objects:
   cyclist
   dog
   bag
 
-confusable objects / synonyms:
+confusable objects:
   stroller
-  pram
-  pushchair
   bicycle
+
+synonym variants:
+  stroller / pram / pushchair
 
 attribute binding:
   red bicycle
@@ -555,41 +668,43 @@ French/English equivalents:
   une poussette / a stroller
   une personne avec un t-shirt blanc / a person with a white T-shirt
 
-absent queries:
-  only concepts that have been manually verified absent from the fixed release
+absent cases:
+  only concepts manually verified absent from the entire pinned benchmark scope
 ```
 
-The exact v1 list is constrained by verified footage. If a proposed concept cannot be confidently annotated from the pinned release, it is excluded rather than guessed.
+The exact list is constrained by verified footage. If a proposed concept cannot be confidently annotated from the release, it is excluded rather than guessed.
 
-Issue #11's original examples (`pink stroller`, `green cap`, `cardboard box`, `red bicycle`, `umbrella`, `blue car`) remain desired benchmark concepts, but they may only enter v1 when the release contains a human-verified positive or when intentionally declared as a verified absent query. The issue text does not itself prove that the current release contains them.
+Issue #11's examples (`pink stroller`, `green cap`, `cardboard box`, `red bicycle`, `umbrella`, `blue car`) remain desired intents, but enter v1 only when the release contains a human-verified positive or when deliberately used as a verified absent query. The issue text itself does not prove that the current release contains them.
 
 ## Annotation workflow
 
-Ground-truth creation is a data-labeling task, not a model-output conversion.
+Ground-truth creation is data labeling, not conversion of model output.
 
 For each candidate intent:
 
-1. inspect the fixed release footage independently enough to identify true positive intervals;
-2. record each verified positive event with source path and interval;
-3. record particularly misleading but wrong intervals as hard negatives with a reason;
-4. verify absent queries across the fixed benchmark scope before labeling them absent;
-5. only then freeze the manifest.
+1. inspect the fixed release footage enough to identify true positive intervals independently;
+2. record every verified positive event with source path and interval;
+3. record particularly misleading wrong intervals as query-specific hard negatives with reasons;
+4. verify absent queries over the entire fixed benchmark scope before marking them absent;
+5. review source paths/timestamps against the pinned media;
+6. freeze the manifest before treating the first baseline scores as evidence.
 
-Current Phase 1F search can be used to jump to candidate timestamps and reduce review effort, but an ANN hit does not become truth until visually verified. Known manual observations from prior testing can seed where to inspect, but the benchmark must record the verified event, not the model's claim.
+Current Phase 1F search may help jump to candidate timestamps, but an ANN hit does not become truth until visually verified. Known manual observations can seed where to inspect; the benchmark records the verified event, not the model's claim.
 
-A later benchmark version can add new labels/media without rewriting v1 history.
+A later benchmark version can add labels/media without rewriting v1 history.
 
 ## GitHub Actions
 
-Phase 1G adds two different automation paths.
+Phase 1G adds two automation paths.
 
 ### Permanent contract workflow
 
-Runs on ordinary PR/push changes affecting evaluation code. It uses deterministic fake embedders/indexes and small repository fixtures only.
+Runs on ordinary PR/push changes affecting evaluation code and uses deterministic fake embedders/indexes plus tiny repository fixtures.
 
 It verifies:
 
 - strict manifest validation;
+- media inventory validation;
 - one-to-one relevance matching;
 - Recall/Precision/rank/MRR calculations;
 - hard-negative attribution;
@@ -597,23 +712,25 @@ It verifies:
 - language/equivalence aggregation;
 - temporal metrics;
 - instrumentation accounting/timing plumbing;
-- CLI JSON output and failure behavior;
+- CLI JSON output/failure behavior;
 - source compilation.
 
-No Jina secret, 844 MB download, or real embedding inference is required for this workflow.
+No Jina secret, 844 MB download, or real embedding inference is required.
 
 ### Real baseline workflow
 
-A manual `workflow_dispatch` workflow runs the actual benchmark:
+A manual `workflow_dispatch` workflow executes:
 
 ```text
 checkout chosen revision
         ↓
-download videos.zip from test-dataset-v1
+download test-dataset-v1/videos.zip
         ↓
-verify size + SHA-256
+verify 844175165 bytes + archive SHA-256
         ↓
-extract expected media
+extract media
+        ↓
+evaluator verifies every extracted file size + SHA-256
         ↓
 start fresh Qdrant
         ↓
@@ -622,30 +739,35 @@ run full semantic benchmark with configured Jina engine
 upload results.json as workflow artifact
 ```
 
-The workflow uses the repository secret for Jina credentials and fails clearly when the secret is unavailable. It does not run on every push because the media download and embedding calls are intentionally expensive.
+The workflow uses the repository Jina secret and fails clearly when unavailable. It does not run on every push because the large download and provider inference are intentionally expensive.
 
-The artifact is evidence for the baseline; it is not automatically committed back to the repository.
+The artifact is evidence for the baseline and is not automatically committed back to the repository.
 
 ## Error handling and validity rules
 
-A benchmark run fails rather than silently degrading when:
+A run fails rather than silently degrading when:
 
 - manifest schema/version is unsupported;
-- query IDs or event IDs are duplicated;
+- benchmark/query/event IDs are invalid or duplicated;
 - a referenced positive/hard-negative event does not exist;
-- a query is both `expect_no_match=true` and has positive events;
-- timestamps are invalid/non-finite/out of order;
-- an event references a source path outside the pinned media inventory;
-- release asset size/digest differs;
-- extracted expected paths differ from the manifest;
-- the configured index embedding identity is incompatible;
-- a full run skips or fails assets;
+- the same event is redundantly referenced within one query role;
+- `expect_no_match=true` has positives;
+- `expect_no_match=false` has no positives;
+- cutoffs are empty, non-positive, duplicated, or unordered;
+- language/family/variant/reason is unsupported;
+- timestamps are invalid, non-finite, or non-positive-duration for video truth;
+- event source paths are non-normalized or outside pinned media inventory;
+- extracted media path/size/SHA-256 differs;
+- release archive size/digest differs in the real workflow;
+- configured search/index embedding identity is incompatible;
+- full mode skips or fails assets;
+- full mode has zero video footage for a metric that requires video hours;
 - evaluation receives malformed/non-finite search results;
 - output path cannot be written.
 
 A query returning zero results is a valid measurement, not a runner failure.
 
-Metric denominators, missing values, and absent-query exclusions must be explicit in the JSON rather than represented by NaN or Infinity. JSON output contains only finite numeric values or null where a metric is mathematically not applicable.
+No hidden timing tolerance, score threshold, or automatic query fallback may be introduced by the evaluator.
 
 ## Testing strategy
 
@@ -657,64 +779,66 @@ Cover:
 
 - valid v1 manifest;
 - strict unknown-field rejection;
-- duplicate IDs;
+- duplicate/invalid IDs;
 - missing event references;
-- malformed release SHA-256;
+- malformed archive/per-file SHA-256;
+- invalid relative source paths;
 - invalid timestamps;
-- invalid/duplicate cutoffs;
-- contradictory absent-query definitions;
-- unsupported family/language/hard-negative reason;
+- invalid/duplicate/unordered cutoffs;
+- contradictory absent/positive definitions;
+- unsupported family/language/variant/reason;
 - media inventory mismatch.
 
 ### Relevance tests
 
 Cover:
 
-- representative timestamp inside/outside truth interval;
+- representative timestamp inside/outside event;
+- no implicit temporal tolerance;
 - same timestamp on wrong asset;
 - deterministic one-to-one matching;
-- duplicate returned windows do not inflate recall/precision;
-- hard-negative attribution after positive matching;
+- duplicate returned windows do not inflate metrics;
+- query-specific hard-negative attribution after positive matching;
+- one event used with different negative reasons by different queries;
 - generic false positives;
 - still-image source matching.
 
 ### Metric tests
 
-Use tiny hand-computable ranked lists to prove exact values for:
+Use hand-computable ranked lists to prove exact values for:
 
-- Recall@1/@3/@K;
-- Precision@K;
-- first relevant rank;
-- MRR;
+- Recall@1/@3/@5/@10;
+- Precision@K with unfilled ranks;
+- first relevant rank and MRR;
 - Success@K;
-- family attribute-binding/confusable-object accuracy;
-- hard-negative rates/reasons;
+- macro Recall/Precision;
+- attribute-binding/confusable-object family accuracy;
+- hard-negative counts/rates and zero-result null rate;
 - absent-query summaries;
-- equivalence-group language gaps;
-- temporal start/end errors and tIoU;
-- p50/p95 latency summary behavior.
+- equivalence/language gaps;
+- temporal signed errors and tIoU;
+- deterministic p50/p95 latency summaries.
 
 ### Instrumentation/runner tests
 
-Use typed fakes to prove:
+Typed fakes prove:
 
-- wrapped `upsert()` counts visuals without changing delegated behavior;
-- ANN latency samples correspond to actual `search_visuals()` calls, including overfetch;
-- full mode rejects skipped/failed indexing runs;
-- search mode never calls mutating index operations;
-- each manifest query is executed exactly once as written;
-- settings/embedding/manifest provenance is emitted;
-- raw cosine remains raw cosine and is never relabeled as confidence.
+- wrapped upserts count total/video/image visuals without changing delegation;
+- ANN latency samples correspond to real delegated `search_visuals()` calls, including overfetch;
+- refinement iterator timing does not alter yielded visuals;
+- full mode rejects skipped/failed runs;
+- search mode never invokes mutating index operations;
+- each query executes exactly once at `max(cutoffs)` and is not rewritten;
+- settings/embedding/manifest/media provenance is emitted;
+- raw cosine remains raw cosine and is never relabeled confidence.
 
 ### Real integration
 
-The existing Qdrant integration workflow receives focused coverage for evaluation components that interact with the real adapter where useful. The expensive public-release/Jina baseline remains the manual real-baseline workflow.
+The existing Qdrant workflow receives focused evaluation coverage where useful. The expensive release/Jina baseline remains a manual workflow.
 
 ## Compatibility with issue #32
 
-Phase 1G intentionally makes later experiments replaceable at the boundary around the system under test.
-
-After the baseline is frozen, #32 experiments can run against the same manifest and produce comparable result JSON for:
+After v1 baseline is frozen, #32 experiments can run against the same manifest and produce comparable result JSON for:
 
 ```text
 current Jina CLIP v1
@@ -728,7 +852,9 @@ VLM/reranker verification
 calibrated no-match policies
 ```
 
-Experiments that require a different visual index must reindex but keep the benchmark manifest fixed. Experiments that only alter query handling can reuse a compatible visual index. Every result artifact records embedding/search settings so incompatible runs are visible rather than silently compared as if identical.
+Experiments requiring a different visual embedding space must reindex but keep the benchmark manifest fixed. Experiments altering only query handling can reuse a compatible index. Every result artifact records identity/settings so incompatible runs are visible rather than silently compared.
+
+Issue #32 remains open after Phase 1G. Phase 1G supplies its benchmark foundation but does not complete the investigation.
 
 ## Branch and PR strategy
 
@@ -738,7 +864,7 @@ Phase 1G is implemented in one focused branch/PR:
 feat/search-evaluation
 ```
 
-The branch starts from the validated Phase 1F head because evaluation depends on the new semantic-search contracts. While PR #28 is unmerged, the Phase 1G PR is stacked against Phase 1F. Once Phase 1F lands on `main`, Phase 1G is retargeted/rebased as appropriate without changing its benchmark contract.
+The branch starts from the validated Phase 1F head because evaluation depends on semantic-search contracts introduced by PR #28. While #28 is unmerged, Phase 1G remains stacked on that work. After Phase 1F lands on `main`, Phase 1G is retargeted/rebased as appropriate without changing the benchmark contract.
 
 The Phase 1G PR description includes:
 
@@ -746,19 +872,20 @@ The Phase 1G PR description includes:
 Closes #11
 ```
 
-Issue #32 remains open after Phase 1G: Phase 1G supplies its benchmark foundation but does not complete the broader semantic-quality investigation.
-
 ## Acceptance criteria
 
 Phase 1G is complete when:
 
-1. a strict versioned benchmark manifest is committed and pins the exact dataset release/digest;
-2. the v1 query set contains independently verified positives/hard negatives/absent cases sufficient to exercise several semantic families without predefined classes;
-3. normal CI proves manifest, relevance, metrics, instrumentation, runner, and CLI contracts without external providers;
-4. the real baseline workflow can reconstruct the pinned dataset, use fresh Qdrant, run the current Jina CLIP v1 indexing/search pipeline, and upload a result artifact;
-5. result JSON reports semantic Recall@K, Precision@K, first relevant rank/MRR, family Success@K, hard-negative behavior, language/synonym consistency, and no-match behavior;
-6. temporal localization metrics are reported separately from semantic correctness;
-7. indexing throughput, vectors per footage hour, end-to-end search latency, and Qdrant ANN latency are reported separately;
-8. no metric is called confidence and no uncalibrated threshold is introduced;
-9. benchmark ground truth is not derived automatically from current model rankings;
-10. the produced baseline artifact is sufficient to compare later #32 experiments without changing the benchmark definition.
+1. a strict versioned manifest pins the exact release archive and every extracted media file identity;
+2. v1 contains independently verified positives, query-specific hard negatives, language/synonym pairs, and verified absent cases across several semantic families without predefined classes;
+3. each query executes exactly once at fixed retrieval depth and all metrics derive from that ranked list;
+4. normal CI proves manifest, relevance, metrics, instrumentation, runner, and CLI contracts without external providers;
+5. the manual real-baseline workflow reconstructs verified media, uses fresh Qdrant, runs current Jina CLIP v1 indexing/search, and uploads result JSON;
+6. result JSON reports Recall@K, Precision@K, first relevant rank/MRR, family Success@K, hard-negative behavior, language/synonym consistency, and no-match behavior;
+7. temporal localization is reported separately from semantic correctness;
+8. indexing throughput, video vectors per footage hour, end-to-end search latency, and Qdrant ANN latency are separate metrics;
+9. no metric is called confidence and no uncalibrated rejection threshold is introduced;
+10. ground truth is not derived automatically from current model rankings;
+11. the baseline artifact can be reused unchanged to compare later issue #32 experiments.
+
+Phase 1's broader quality exit criterion is evaluated from this artifact rather than silently enforced by tuning Phase 1G. If the frozen baseline shows a semantic weakness, that evidence becomes input to #32 instead of changing annotations or evaluator behavior after seeing the scores.
